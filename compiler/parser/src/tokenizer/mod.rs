@@ -22,7 +22,7 @@
 pub(crate) mod token;
 
 pub use self::token::KEYWORD_TOKENS;
-pub(crate) use self::token::*;
+pub use self::token::*;
 
 pub(crate) mod lexer;
 pub(crate) use self::lexer::*;
@@ -32,7 +32,7 @@ use leo_span::Span;
 use std::iter;
 
 /// Creates a new vector of spanned tokens from a given file path and source code text.
-pub(crate) fn tokenize(input: &str, start_pos: u32) -> Result<Vec<SpannedToken>> {
+pub fn tokenize(input: &str, start_pos: u32) -> Result<Vec<SpannedToken>> {
     tokenize_iter(input, start_pos).collect()
 }
 

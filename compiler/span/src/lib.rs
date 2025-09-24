@@ -18,7 +18,7 @@
 #![recursion_limit = "256"]
 
 mod symbol;
-pub use symbol::{Symbol, create_session_if_not_set_then, sym, with_session_globals};
+pub use symbol::{SESSION_GLOBALS, SessionGlobals, Symbol, create_session_if_not_set_then, sym, with_session_globals};
 
 mod span;
 pub use span::Span;

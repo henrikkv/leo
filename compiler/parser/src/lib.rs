@@ -23,9 +23,9 @@
 #![allow(clippy::vec_init_then_push)]
 #![doc = include_str!("../README.md")]
 
-pub(crate) mod tokenizer;
+pub mod tokenizer;
 pub use tokenizer::KEYWORD_TOKENS;
-pub(crate) use tokenizer::*;
+pub use tokenizer::*;
 
 pub mod parser;
 pub use parser::*;

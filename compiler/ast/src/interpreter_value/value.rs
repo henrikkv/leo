@@ -53,7 +53,7 @@ use crate::{Expression, IntegerType, NodeBuilder, Type};
 
 pub(crate) type CurrentNetwork = TestnetV0;
 
-pub(crate) type SvmValue = SvmValueParam<CurrentNetwork>;
+pub type SvmValue = SvmValueParam<CurrentNetwork>;
 pub(crate) type ProgramID = ProgramIDParam<CurrentNetwork>;
 pub(crate) type SvmPlaintext = Plaintext<CurrentNetwork>;
 pub(crate) type SvmLiteral = SvmLiteralParam<CurrentNetwork>;
@@ -76,13 +76,13 @@ pub struct GlobalId {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub struct Value {
     pub id: Option<GlobalId>,
-    pub(crate) contents: ValueVariants,
+    pub contents: ValueVariants,
 }
 
 #[derive(Clone, Default, Debug, Eq, PartialEq)]
 // SnarkVM's Value is large, but that's okay.
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum ValueVariants {
+pub enum ValueVariants {
     #[default]
     Unit,
     Svm(SvmValue),
