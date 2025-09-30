@@ -900,7 +900,10 @@ impl Cursor {
                 }
                 return Ok(());
             }
-            Position(_) => return Ok(()),
+            Position(_) => {
+                self.increment_instruction_index();
+                return Ok(());
+            }
         };
 
         self.set_register(destination, value);
