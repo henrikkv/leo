@@ -27,12 +27,12 @@ use leo_errors::{CompilerError, Handler, InterpreterHalt, LeoError, Result};
 pub struct Interpreter {
     pub cursor: Cursor,
     actions: Vec<InterpreterAction>,
-    handler: Handler,
+    pub handler: Handler,
     pub node_builder: NodeBuilder,
     breakpoints: Vec<Breakpoint>,
     pub watchpoints: Vec<Watchpoint>,
     saved_cursors: Vec<Cursor>,
-    filename_to_program: HashMap<PathBuf, String>,
+    pub filename_to_program: HashMap<PathBuf, String>,
     parsed_inputs: u32,
     /// The network.
     network: NetworkName,

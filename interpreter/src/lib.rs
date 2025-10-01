@@ -48,7 +48,7 @@ mod test_interpreter;
 mod util;
 use util::*;
 
-mod cursor;
+pub mod cursor;
 use cursor::*;
 
 mod interpreter;
@@ -389,6 +389,6 @@ fn tokenize_user_input(input: &str) -> (&str, &str) {
 
     (first.trim(), rest.trim())
 }
-pub use cursor::{Cursor, Element, Frame, StepResult};
+pub use cursor::{Cursor, Element, Frame, FunctionVariant, StepResult};
 pub use interpreter::{Breakpoint, Interpreter, InterpreterAction};
 pub use leo_ast::interpreter_value::{SvmValue, Value as InterpreterValue};
