@@ -83,6 +83,24 @@ impl Program {
 
         let source_path = source_directory.join(MAIN_FILENAME);
 
+        if !source_path.exists() {
+            let aleo_path = source_directory.join("main.aleo");
+            if aleo_path.exists() {
+                let dependencies_map: IndexMap<Symbol, Dependency> = manifest
+                    .dependencies
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|dependency| {
+                        let dependency = canonicalize_dependency_path_relative_to(path, dependency)?;
+                        let dep_symbol = crate::symbol(&dependency.name)?;
+                        Ok((dep_symbol, dependency))
+                    })
+                    .collect::<Result<IndexMap<Symbol, Dependency>>>()?;
+
+                return Self::from_aleo_path_impl(name, &aleo_path, &dependencies_map);
+            }
+        }
+
         Ok(Program {
             name,
             data: ProgramData::SourcePath { directory: path.to_path_buf(), source: source_path },
