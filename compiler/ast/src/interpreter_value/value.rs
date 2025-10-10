@@ -347,7 +347,31 @@ impl From<SvmPlaintext> for Value {
 
 impl From<SvmValue> for Value {
     fn from(x: SvmValue) -> Self {
-        ValueVariants::Svm(x).into()
+        // Convert records to structs since the interpreter treats records as structs
+        match x {
+            SvmValueParam::Record(record) => {
+                let owner_addr = match record.owner() {
+                    Owner::Public(addr) => *addr,
+                    Owner::Private(Plaintext::Literal(SvmLiteralParam::Address(addr), _)) => *addr,
+                    _ => panic!("Expected address in owner"),
+                };
+
+                let mut members: indexmap::IndexMap<_, _> = record.data().iter().map(|(name, entry)| {
+                    let plaintext = match entry {
+                        Entry::Public(p) | Entry::Private(p) | Entry::Constant(p) => p.clone(),
+                    };
+                    (name.clone(), plaintext)
+                }).collect();
+
+                members.insert(
+                    SvmIdentifier::from_str("owner").unwrap(),
+                    Plaintext::from(SvmLiteralParam::Address(owner_addr))
+                );
+
+                ValueVariants::Svm(SvmValueParam::Plaintext(Plaintext::Struct(members, std::sync::OnceLock::new()))).into()
+            }
+            other => ValueVariants::Svm(other).into(),
+        }
     }
 }
 
