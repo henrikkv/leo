@@ -42,9 +42,6 @@ impl Value {
     /// fail when comparing values of different types,
     /// rather than just returning false.
     pub fn eq(&self, rhs: &Self) -> Result<bool> {
-        if self.id != rhs.id {
-            return Ok(false);
-        }
         use ValueVariants::*;
         Ok(match (&self.contents, &rhs.contents) {
             (Unsuffixed(..), _) | (_, Unsuffixed(..)) => halt_no_span2!("Error"),
