@@ -44,6 +44,7 @@ pub(crate) use snarkvm::prelude::{
     Identifier as SvmIdentifierParam,
     Literal as SvmLiteralParam,
     Plaintext,
+    Signature as SvmSignature,
     TestnetV0,
     Value as SvmValueParam,
 };
@@ -66,6 +67,7 @@ pub(crate) type Scalar = SvmScalar<CurrentNetwork>;
 pub(crate) type Address = SvmAddress<CurrentNetwork>;
 pub(crate) type Boolean = SvmBoolean<CurrentNetwork>;
 pub(crate) type Future = FutureParam<CurrentNetwork>;
+pub(crate) type Signature = SvmSignature<CurrentNetwork>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StructContents {
@@ -88,6 +90,7 @@ pub enum ValueVariants {
     Tuple(Vec<Value>),
     Unsuffixed(String),
     Future(Vec<AsyncExecution>),
+    String(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -186,6 +189,10 @@ impl Hash for ValueVariants {
                     hash_plaintext(plaintext, state);
                 }
             },
+            String(s) => {
+                9u8.hash(state);
+                s.hash(state);
+            }
         }
     }
 }
@@ -296,6 +303,20 @@ impl_from_literal! {
     Field; Group; Scalar; Address;
 }
 
+impl TryFrom<Value> for snarkvm::prelude::Signature<CurrentNetwork> {
+    type Error = ();
+
+    fn try_from(x: Value) -> Result<Self, Self::Error> {
+        if let ValueVariants::Svm(SvmValueParam::Plaintext(Plaintext::Literal(SvmLiteralParam::Signature(val), ..))) =
+            x.contents
+        {
+            Ok(*val)
+        } else {
+            Err(())
+        }
+    }
+}
+
 impl From<Future> for Value {
     fn from(value: Future) -> Self {
         SvmValueParam::Future(value).into()
@@ -381,6 +402,14 @@ impl From<Vec<AsyncExecution>> for Value {
     }
 }
 
+impl TryFrom<Value> for String {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        if let ValueVariants::String(s) = value.contents { Ok(s) } else { Err(()) }
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.contents {
@@ -399,6 +428,7 @@ impl fmt::Display for Value {
             ValueVariants::Tuple(vec) => write!(f, "({})", vec.iter().format(", ")),
             ValueVariants::Unsuffixed(s) => s.fmt(f),
             ValueVariants::Future(_async_executions) => "Future".fmt(f),
+            ValueVariants::String(s) => write!(f, "\"{s}\""),
         }
     }
 }
@@ -786,6 +816,10 @@ impl Value {
         ValueVariants::Tuple(contents.into_iter().collect()).into()
     }
 
+    pub fn make_string(s: String) -> Self {
+        ValueVariants::String(s).into()
+    }
+
     /// Gets the type of a `Value` but only if it is an integer, a field, a group, or a scalar.
     /// Return `None` otherwise. These are the only types that an unsuffixed literal can have.
     pub fn get_numeric_type(&self) -> Option<Type> {
@@ -853,8 +887,8 @@ impl Value {
                 SvmValueParam::Record(..) => return None,
                 SvmValueParam::Future(..) => return None,
             },
-
             ValueVariants::Future(..) => return None,
+            ValueVariants::String(..) => return None,
         };
 
         Some(expression)
@@ -974,17 +1008,17 @@ impl FromStr for Value {
         }
 
         // Or it's a tuple.
-        if let Some(s) = s.strip_prefix("(") {
-            if let Some(s) = s.strip_suffix(")") {
-                let mut results = Vec::new();
-                for item in s.split(',') {
-                    let item = item.trim();
-                    let value: Value = item.parse().map_err(|_| ())?;
-                    results.push(value);
-                }
-
-                return Ok(Value::make_tuple(results));
+        if let Some(s) = s.strip_prefix("(")
+            && let Some(s) = s.strip_suffix(")")
+        {
+            let mut results = Vec::new();
+            for item in s.split(',') {
+                let item = item.trim();
+                let value: Value = item.parse().map_err(|_| ())?;
+                results.push(value);
             }
+
+            return Ok(Value::make_tuple(results));
         }
 
         // Or it's an unsuffixed numeric literal.

@@ -176,9 +176,9 @@ create_messages!(
     /// Attempted to define more that one struct member with the same name.
     @formatted
     duplicate_struct_member {
-        args: (struct_: impl Display),
+        args: (member_name: impl Display),
         msg: format!(
-            "Struct {struct_} defined with more than one member with the same name."
+            "Struct field `{member_name}` is already declared."
         ),
         help: None,
     }
@@ -186,9 +186,9 @@ create_messages!(
     /// Attempted to define more that one record variable with the same name.
     @formatted
     duplicate_record_variable {
-        args: (record: impl Display),
+        args: (variable_name: impl Display),
         msg: format!(
-            "Record {record} defined with more than one variable with the same name."
+            "Record variable `{variable_name}` is already declared."
         ),
         help: None,
     }
@@ -1317,6 +1317,44 @@ create_messages!(
         ),
         help: Some(
             "Outputs of `transition`, `async transition`, and `function` definitions cannot be optional or contain optionals. Consider moving the optionality outside the function call.".to_string()
+        ),
+    }
+
+    @formatted
+    invalid_storage_type {
+        args: (type_: impl Display),
+        msg: format!("{type_} is an invalid storage type"),
+        help: None,
+    }
+
+    @formatted
+    storage_vectors_cannot_be_moved_or_assigned {
+        args: (),
+        msg: format!(
+            "Storage vectors cannot be moved or assigned. You can only access or modify them using methods like `get`, `push`, or `pop`."
+        ),
+        help: None,
+    }
+
+    @formatted
+    function_has_too_many_inputs {
+        args: (variant: impl Display, name: impl Display, limit: usize, actual: usize),
+        msg: format!(
+            "The {variant} `{name}` has {actual} input parameters, which exceeds the allowed limit of {limit}.",
+        ),
+        help: Some(
+            "Consider reducing the number of input parameters. You might combine some parameters into a struct or refactor the {variant} to simplify its signature.".to_string()
+        ),
+    }
+
+    @formatted
+    function_has_too_many_outputs {
+        args: (variant: impl Display, name: impl Display, limit: usize, actual: usize),
+        msg: format!(
+            "The {variant} `{name}` has {actual} output parameters, which exceeds the allowed limit of {limit}.",
+        ),
+        help: Some(
+            "Consider reducing the number of output parameters. You might combine some parameters into a struct or refactor the {variant} to simplify its signature.".to_string()
         ),
     }
 );

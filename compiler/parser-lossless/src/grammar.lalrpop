@@ -109,6 +109,15 @@ Type1: SyntaxNode<'a> = {
     },
 }
 
+// Storage variables can have any type (some exceptions apply during semantic checking) in addition to the vector type
+StorageType: SyntaxNode<'a> = {
+    Type,
+
+    <l:WithTrivia<LeftSquare>> <t:Type> <r:WithTrivia<RightSquare>> => {
+        SyntaxNode::new(TypeKind::Vector, [l, t, r])
+    }
+}
+
 // All types including tuples and unit
 // These types can potentially be wrapped in an optional.
 Type: SyntaxNode<'a> = {
@@ -269,13 +278,14 @@ Expr0: SyntaxNode<'a> = {
 
     // Function call or associated function call.
     <name:FunctionIdentifier> <c:(ConstArgumentList)?> <l:WithTrivia<LeftParen>> <exprs:CommaMaybe<Expr>> <r:WithTrivia<RightParen>> => {
-        let kind = if c.is_none() && matches!(
+        let kind = if matches!(
             crate::two_path_components(name.text),
             Some(
                 (
                     "BHP256" | "BHP512" |"BHP768" | "BHP1024" | "ChaCha" | "Keccak256" | "Keccak384" | "Keccak512" |
                     "Pedersen64" | "Pedersen128" | "Poseidon2" | "Poseidon4" | "Poseidon8" | "SHA3_256" | "SHA3_384" |
-                    "SHA3_512" | "Mapping" | "Program" | "signature" | "Future" | "CheatCode" | "group",
+                    "SHA3_512" | "Mapping" | "Program" | "signature" | "Future" | "CheatCode" | "group" | "ECDSA" | 
+                    "Serialize" | "Deserialize",
                     _
                 )
             )
@@ -501,8 +511,20 @@ ConstParameterList: SyntaxNode<'a> = {
     },
 }
 
+ ArrayOrNamedPrimitiveType: SyntaxNode<'a> = {
+    <NamedPrimitiveType>,
+    <l:WithTrivia<LeftSquare>> <t:ArrayOrNamedPrimitiveType> <s:WithTrivia<Semicolon>> <i:Expr> <r:WithTrivia<RightSquare>> => {
+        SyntaxNode::new(TypeKind::Array, [l, t, s, i, r])
+    },
+}
+
+GenericArgument: SyntaxNode<'a> = {
+    <Expr>,
+    <ArrayOrNamedPrimitiveType>,
+}
+
 ConstArgumentList: SyntaxNode<'a> = {
-    <c:NoTrivia<DoubleColon>> <l:WithTrivia<LeftSquare>> <ps:CommaMaybe<Expr>> <r:WithTrivia<RightSquare>> => {
+    <c:NoTrivia<DoubleColon>> <l:WithTrivia<LeftSquare>> <ps:CommaMaybe<GenericArgument>> <r:WithTrivia<RightSquare>> => {
         SyntaxNode::new(SyntaxKind::ConstArgumentList, [c, l].into_iter().chain(ps).chain([r]))
     },
 }
@@ -765,11 +787,18 @@ MappingDeclaration: SyntaxNode<'a> = {
     }
 }
 
+StorageDeclaration: SyntaxNode<'a> = {
+    <m:WithTrivia<Storage>> <i:WithTrivia<CheckedIdentifier>> <c:WithTrivia<Colon>> <t:StorageType> <s:WithTrivia<Semicolon>> => {
+        SyntaxNode::new(SyntaxKind::Storage, [m, i, c, t, s])
+    }
+}
+
 Item: SyntaxNode<'a> = {
     ConstructorDeclaration,
     FunctionDeclaration,
     GlobalConst,
     MappingDeclaration,
+    StorageDeclaration,
     RecordDeclaration,
     StructDeclaration,
 }
@@ -930,6 +959,7 @@ extern {
         Inline => LalrToken { token: Token::Inline, .. },
         Let => LalrToken { token: Token::Let, .. },
         Mapping => LalrToken { token: Token::Mapping, .. },
+        Storage => LalrToken { token: Token::Storage, .. },
         Network => LalrToken { token: Token::Network, .. },
         Private => LalrToken { token: Token::Private, .. },
         Program => LalrToken { token: Token::Program, .. },

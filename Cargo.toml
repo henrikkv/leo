@@ -31,7 +31,7 @@ include = [
 ]
 license = "GPL-3.0"
 edition = "2024"
-rust-version = "1.88.0"
+rust-version = "1.90.0"
 
 [workspace]
 members = [
@@ -143,6 +143,9 @@ features = ["serde"]
 [workspace.dependencies.itertools]
 version = "0.13.0"
 
+[workspace.dependencies.paste]
+version = "1.0"
+
 [workspace.dependencies.rand]
 version = "0.8"
 default-features = false
@@ -150,6 +153,9 @@ default-features = false
 [workspace.dependencies.rand_chacha]
 version = "0.3.0"
 default-features = false
+
+[workspace.dependencies.rayon]
+version = "1.11.0"
 
 [workspace.dependencies.regex]
 version = "1.11.1"
@@ -173,8 +179,10 @@ version = "3.1.1"
 version = "0.10.9"
 
 [workspace.dependencies.snarkvm]
-version = "4.2.0"
-features = ["cli", "test_consensus_heights"]
+#version = "4.2.0"
+git = "http://github.com/ProvableHQ/snarkVM.git"
+rev = "eb44d39" # testnet-v4.3.0
+features = ["test_consensus_heights"]
 
 [workspace.dependencies.tempfile]
 version = "3.13"
@@ -271,7 +279,13 @@ version = "0.12.1"
 [dependencies.rand]
 workspace = true
 
+[dependencies.rayon]
+workspace = true
+
 [dependencies.rand_chacha]
+workspace = true
+
+[dependencies.regex]
 workspace = true
 
 [dependencies.rpassword]

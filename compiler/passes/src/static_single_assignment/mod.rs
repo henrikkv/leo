@@ -62,9 +62,10 @@ mod program;
 
 mod statement;
 
-mod visitor;
+pub mod visitor;
 use visitor::*;
 
+#[derive(Clone)]
 pub struct SsaFormingInput {
     pub rename_defs: bool,
 }

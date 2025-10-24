@@ -63,6 +63,7 @@ pub enum SyntaxKind {
     StructMemberDeclarationList,
 
     Mapping,
+    Storage,
 
     GlobalConst,
 
@@ -119,6 +120,7 @@ pub enum TypeKind {
     Signature,
     String,
     Tuple,
+    Vector,
     Numeric,
     Unit,
 }
@@ -298,7 +300,7 @@ fn two_path_components(text: &str) -> Option<(&str, &str)> {
     let mut iter = text.split("::");
 
     match (iter.next(), iter.next(), iter.next()) {
-        (Some(first), Some(second), None) => Some((first, second)),
+        (Some(first), Some(second), _) => Some((first, second)),
         _ => None,
     }
 }
