@@ -60,6 +60,8 @@ pub trait CoreFunctionHelper {
 
     fn set_block_height(&mut self, _height: u32) {}
 
+    fn set_block_timestamp(&mut self, _timestamp: i64) {}
+
     fn set_signer(&mut self, _private_key: String) -> Result<()> {
         Ok(())
     }
@@ -241,6 +243,11 @@ pub fn evaluate_core_function(
         CoreFunction::CheatCodeSetBlockHeight => {
             let height: u32 = helper.pop_value()?.try_into().expect_tc(span)?;
             helper.set_block_height(height);
+            Value::make_unit()
+        }
+        CoreFunction::CheatCodeSetBlockTimestamp => {
+            let timestamp: i64 = helper.pop_value()?.try_into().expect_tc(span)?;
+            helper.set_block_timestamp(timestamp);
             Value::make_unit()
         }
         CoreFunction::CheatCodeSetSigner => {

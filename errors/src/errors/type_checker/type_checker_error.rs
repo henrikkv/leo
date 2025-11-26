@@ -324,7 +324,7 @@ create_messages!(
     @formatted
     invalid_operation_outside_finalize {
         args: (operation: impl Display),
-        msg: format!("`{operation}` must be inside an async function block."),
+        msg: format!("`{operation}` must be inside an async function or an async block."),
         help: None,
     }
 
@@ -557,7 +557,7 @@ create_messages!(
     @formatted
     invalid_block_access {
         args: (),
-        msg: format!("The allowed accesses to `block` are `block.height`."),
+        msg: format!("The allowed accesses to `block` are `block.height` and `block.timestamp`."),
         help: None,
     }
 

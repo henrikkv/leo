@@ -71,6 +71,7 @@ pub enum CoreFunction {
 
     CheatCodePrintMapping,
     CheatCodeSetBlockHeight,
+    CheatCodeSetBlockTimestamp,
     CheatCodeSetSigner,
 }
 
@@ -98,21 +99,21 @@ impl CoreFunction {
             (sym::BHP256, sym::commit_to_address)   => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Address),
             (sym::BHP256, sym::commit_to_field)     => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Field),
             (sym::BHP256, sym::commit_to_group)     => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Group),
-            (sym::BHP512, sym::commit_to_address)   => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Address),
-            (sym::BHP512, sym::commit_to_field)     => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Field),
-            (sym::BHP512, sym::commit_to_group)     => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Group),
-            (sym::BHP768, sym::commit_to_address)   => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Address),
-            (sym::BHP768, sym::commit_to_field)     => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Field),
-            (sym::BHP768, sym::commit_to_group)     => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Group),
-            (sym::BHP1024, sym::commit_to_address)   => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Address),
-            (sym::BHP1024, sym::commit_to_field)     => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Field),
-            (sym::BHP1024, sym::commit_to_group)     => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Group),
-            (sym::Pedersen64, sym::commit_to_address)   => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Address),
-            (sym::Pedersen64, sym::commit_to_field)     => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Field),
-            (sym::Pedersen64, sym::commit_to_group)     => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Group),
-            (sym::Pedersen128, sym::commit_to_address)   => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Address),
-            (sym::Pedersen128, sym::commit_to_field)     => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Field),
-            (sym::Pedersen128, sym::commit_to_group)     => Self::Commit(CommitVariant::CommitBHP256, LiteralType::Group),
+            (sym::BHP512, sym::commit_to_address)   => Self::Commit(CommitVariant::CommitBHP512, LiteralType::Address),
+            (sym::BHP512, sym::commit_to_field)     => Self::Commit(CommitVariant::CommitBHP512, LiteralType::Field),
+            (sym::BHP512, sym::commit_to_group)     => Self::Commit(CommitVariant::CommitBHP512, LiteralType::Group),
+            (sym::BHP768, sym::commit_to_address)   => Self::Commit(CommitVariant::CommitBHP768, LiteralType::Address),
+            (sym::BHP768, sym::commit_to_field)     => Self::Commit(CommitVariant::CommitBHP768, LiteralType::Field),
+            (sym::BHP768, sym::commit_to_group)     => Self::Commit(CommitVariant::CommitBHP768, LiteralType::Group),
+            (sym::BHP1024, sym::commit_to_address)   => Self::Commit(CommitVariant::CommitBHP1024, LiteralType::Address),
+            (sym::BHP1024, sym::commit_to_field)     => Self::Commit(CommitVariant::CommitBHP1024, LiteralType::Field),
+            (sym::BHP1024, sym::commit_to_group)     => Self::Commit(CommitVariant::CommitBHP1024, LiteralType::Group),
+            (sym::Pedersen64, sym::commit_to_address)   => Self::Commit(CommitVariant::CommitPED64, LiteralType::Address),
+            (sym::Pedersen64, sym::commit_to_field)     => Self::Commit(CommitVariant::CommitPED64, LiteralType::Field),
+            (sym::Pedersen64, sym::commit_to_group)     => Self::Commit(CommitVariant::CommitPED64, LiteralType::Group),
+            (sym::Pedersen128, sym::commit_to_address)   => Self::Commit(CommitVariant::CommitPED128, LiteralType::Address),
+            (sym::Pedersen128, sym::commit_to_field)     => Self::Commit(CommitVariant::CommitPED128, LiteralType::Field),
+            (sym::Pedersen128, sym::commit_to_group)     => Self::Commit(CommitVariant::CommitPED128, LiteralType::Group),
 
             (sym::BHP256, sym::hash_to_address)     => Self::Hash(HashVariant::HashBHP256, Type::Address),
             (sym::BHP256, sym::hash_to_field)       => Self::Hash(HashVariant::HashBHP256, Type::Field),
@@ -613,6 +614,7 @@ impl CoreFunction {
 
             (sym::CheatCode, sym::print_mapping) => Self::CheatCodePrintMapping,
             (sym::CheatCode, sym::set_block_height) => Self::CheatCodeSetBlockHeight,
+            (sym::CheatCode, sym::set_block_timestamp) => Self::CheatCodeSetBlockTimestamp,
             (sym::CheatCode, sym::set_signer) => Self::CheatCodeSetSigner,
             _ => return None,
         })
@@ -657,6 +659,7 @@ impl CoreFunction {
 
             Self::CheatCodePrintMapping => 1,
             Self::CheatCodeSetBlockHeight => 1,
+            Self::CheatCodeSetBlockTimestamp => 1,
             Self::CheatCodeSetSigner => 1,
         }
     }
@@ -691,6 +694,7 @@ impl CoreFunction {
             | CoreFunction::Deserialize(_, _)
             | CoreFunction::CheatCodePrintMapping
             | CoreFunction::CheatCodeSetBlockHeight
+            | CoreFunction::CheatCodeSetBlockTimestamp
             | CoreFunction::CheatCodeSetSigner => false,
         }
     }
@@ -705,6 +709,7 @@ impl CoreFunction {
             | CoreFunction::VectorClear
             | CoreFunction::CheatCodePrintMapping
             | CoreFunction::CheatCodeSetBlockHeight
+            | CoreFunction::CheatCodeSetBlockTimestamp
             | CoreFunction::CheatCodeSetSigner
             | CoreFunction::VectorPop
             | CoreFunction::VectorSwapRemove => false,
