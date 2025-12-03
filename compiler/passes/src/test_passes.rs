@@ -33,17 +33,18 @@ To add a new compiler pass, you need to update this file and create the test dir
 1. Add a new entry to the `compiler_passes!` table:
 
 ```rust
-(runner_name, PassStruct, (input))
+(runner_name, PassStruct, (input), run_type_checking)
 ```
 
 - `runner_name` – the function name for this pass runner (snake_case).
 - `PassStruct` – the compiler pass struct you are testing.
 - `input` – the argument to the pass (`()` if none, or a struct literal like `(SsaFormingInput { rename_defs: true })`).
+- `run_prelude` - whether to run setup passes such as type checking before this pass, you most likely want this to be true
 
 Example:
 
 ```rust
-(new_pass_runner, NewPass, (NewPassInput { option: true })),
+(new_pass_runner, NewPass, (NewPassInput { option: true }), true),
 ```
 
 2. No other code needs to change — macros automatically generate:
@@ -80,7 +81,7 @@ This structure ensures that **adding a new compiler pass test is minimal**:
 */
 
 use crate::*;
-use leo_ast::{Ast, NetworkName, NodeBuilder};
+use leo_ast::NetworkName;
 use leo_errors::{BufferEmitter, Handler};
 use leo_parser::parse_ast;
 use leo_span::{create_session_if_not_set_then, source_map::FileName, with_session_globals};
@@ -92,62 +93,67 @@ use serial_test::serial;
 macro_rules! compiler_passes {
     ($macro:ident) => {
         $macro! {
-            (common_subexpression_elimination_runner, CommonSubexpressionEliminating, ()),
-            (const_prop_unroll_and_morphing_runner, ConstPropUnrollAndMorphing, (TypeCheckingInput::new(NetworkName::TestnetV0))),
-            (destructuring_runner, Destructuring, ()),
-            (dead_code_elimination_runner, DeadCodeEliminating, ()),
-            (flattening_runner, Flattening, ()),
-            (function_inlining_runner, FunctionInlining, ()),
-            (option_lowering_runner, OptionLowering, (TypeCheckingInput::new(NetworkName::TestnetV0))),
-            (processing_async_runner, ProcessingAsync, (TypeCheckingInput::new(NetworkName::TestnetV0))),
-            (processing_script_runner, ProcessingScript, ()),
-            (ssa_forming_runner, SsaForming, (SsaFormingInput { rename_defs: true })),
-            (storage_lowering_runner, StorageLowering, (TypeCheckingInput::new(NetworkName::TestnetV0))),
-            (write_transforming_runner, WriteTransforming, ())
+            (common_subexpression_elimination_runner, CommonSubexpressionEliminating, (), true),
+            (const_prop_unroll_and_morphing_runner, ConstPropUnrollAndMorphing, (TypeCheckingInput::new(NetworkName::TestnetV0)), true),
+            (destructuring_runner, Destructuring, (), true),
+            (dead_code_elimination_runner, DeadCodeEliminating, (), true),
+            (flattening_runner, Flattening, (), true),
+            (function_inlining_runner, FunctionInlining, (), true),
+            (option_lowering_runner, OptionLowering, (TypeCheckingInput::new(NetworkName::TestnetV0)), true),
+            (processing_async_runner, ProcessingAsync, (TypeCheckingInput::new(NetworkName::TestnetV0)), true),
+            (processing_script_runner, ProcessingScript, (), true),
+            (ssa_forming_runner, SsaForming, (SsaFormingInput { rename_defs: true }), true),
+            (storage_lowering_runner, StorageLowering, (TypeCheckingInput::new(NetworkName::TestnetV0)), true),
+            (write_transforming_runner, WriteTransforming, (), true),
+            (remove_unreachable, RemoveUnreachable, (), false)
         }
     };
-}
-
-/// Parse a Leo source program into an AST, returning errors via the handler.
-fn parse_program(source: &str, handler: &Handler) -> Result<Ast, ()> {
-    let node_builder = NodeBuilder::default();
-    let filename = FileName::Custom("test".into());
-
-    // Add the source to the session's source map
-    let source_file = with_session_globals(|s| s.source_map.new_source(source, filename));
-
-    handler.extend_if_error(parse_ast(handler.clone(), &node_builder, &source_file, &[], NetworkName::TestnetV0))
 }
 
 /// Macro to generate a single runner function for a compiler pass.
 ///
 /// Each runner:
 /// - Sets up a BufferEmitter and Handler for error/warning reporting.
+/// - Parse the test into an AST.
 /// - Runs the first three fixed passes: PathResolution, SymbolTableCreation, TypeChecking.
 /// - Runs the specified compiler pass.
 /// - Returns the resulting AST or formatted errors/warnings.
 macro_rules! make_runner {
-    ($runner_name:ident, $pass:ident, $input:expr) => {
+    ($runner_name:ident, $pass:ident, $input:expr, $run_prelude:expr) => {
         fn $runner_name(source: &str) -> String {
             let buf = BufferEmitter::new();
             let handler = Handler::new(buf.clone());
 
             create_session_if_not_set_then(|_| {
-                // Parse program into AST
-                let mut state = match parse_program(source, &handler) {
-                    Ok(ast) => CompilerState { ast, handler: handler.clone(), ..Default::default() },
+                let mut state = CompilerState { handler: handler.clone(), ..Default::default() };
+
+                state.ast = match handler.extend_if_error(parse_ast(
+                    handler.clone(),
+                    &state.node_builder,
+                    &with_session_globals(|s| s.source_map.new_source(source, FileName::Custom("test".into()))),
+                    &[],
+                    NetworkName::TestnetV0,
+                )) {
+                    Ok(ast) => ast,
                     Err(()) => return format!("{}{}", buf.extract_errs(), buf.extract_warnings()),
                 };
 
-                // Always run these three passes before the tested pass; they populate symbol & type tables,
+                // Run these three passes before the tested pass; they populate symbol & type tables,
                 // which are required for the following compiler pass to function correctly.
-                if handler.extend_if_error(PathResolution::do_pass((), &mut state)).is_err()
-                    || handler.extend_if_error(SymbolTableCreation::do_pass((), &mut state)).is_err()
-                    || handler
+                // Type checking may be disabled by argument
+                if $run_prelude {
+                    if handler.extend_if_error(PathResolution::do_pass((), &mut state)).is_err() {
+                        return format!("{}{}", buf.extract_errs(), buf.extract_warnings());
+                    }
+                    if handler.extend_if_error(SymbolTableCreation::do_pass((), &mut state)).is_err() {
+                        return format!("{}{}", buf.extract_errs(), buf.extract_warnings());
+                    }
+                    if handler
                         .extend_if_error(TypeChecking::do_pass(TypeCheckingInput::new(state.network), &mut state))
                         .is_err()
-                {
-                    return format!("{}{}", buf.extract_errs(), buf.extract_warnings());
+                    {
+                        return format!("{}{}", buf.extract_errs(), buf.extract_warnings());
+                    }
                 }
 
                 // Run the specific pass
@@ -164,9 +170,9 @@ macro_rules! make_runner {
 
 /// Macro to generate all runners from the compiler_passes table.
 macro_rules! make_all_runners {
-    ($(($runner:ident, $pass:ident, $input:tt)),* $(,)?) => {
+    ($(($runner:ident, $pass:ident, $input:tt, $run_prelude:tt)),* $(,)?) => {
         $(
-            make_runner!($runner, $pass, $input);
+            make_runner!($runner, $pass, $input, $run_prelude);
         )*
     };
 }
@@ -179,7 +185,7 @@ compiler_passes!(make_all_runners);
 /// - Uses `leo_test_framework::run_tests` with a path derived from the pass struct name.
 /// - Uses `paste::paste!` to safely concatenate identifiers.
 macro_rules! make_all_tests {
-    ($(($runner:ident, $pass:ident, $input:tt)),* $(,)?) => {
+    ($(($runner:ident, $pass:ident, $input:tt, $run_prelude:tt)),* $(,)?) => {
         $(
             paste::paste! {
                 #[test]
