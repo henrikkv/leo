@@ -4,25 +4,27 @@ title: Your Development Environment
 sidebar_label: Dev Env
 ---
 
-[general tags]: # "playground, ide, plugin"
+[general tags]: # "ide, plugin"
 
 Developers can choose from a wide variety of development environments.
 
-## Leo Playground
+## Language Server
 
-[Leo Playground](https://play.leo-lang.org) is a web-based IDE that is designed to allow developers to develop, deploy, and execute programs all in the browser! It comes with an editor, Github integrations, and a number of utilities to manage programs and interface with the network.
+Leo ships a Language Server Protocol (LSP) implementation (`leo-lsp`) that powers the editor plugins listed below. The server exposes the following capabilities:
 
-![Leo Playground](./../img/leo-playground.png)
+- **Semantic highlighting** — token classification driven by the compiler's own analysis, so keywords, types, and identifiers are highlighted consistently with how Leo actually parses your code.
+- **Push diagnostics** — compile errors and warnings (including the CEI analysis warnings described in the [Finalization Model guide](../guides/01_finalization.md#checks-effects-interactions-cei)) are surfaced inline as you edit, using the same ariadne-rendered messages you see on the command line.
+- **Go to definition** — jump from any identifier to where it is defined, including across module and library boundaries.
+- **Find all references** — list every use of a symbol across the package.
+- **Rename** — rename a symbol everywhere it is used. The server uses `prepare-rename` to validate the target before applying the edit.
 
-:::note
-Developers may find that generating transactions is slower in the browser. This is because the underlying algorithms for generating proofs are computationally expensive. We're actively working on making this better!
-:::
+The server does not currently provide hover, completion, or code actions. These are tracked for future releases.
 
 ## Plugins
 
 <!--TODO: Condense this.--->
 
-The Leo team also maintains a plugin for a number of different editors. If you do not see your favorite editor on this list, please reach out on [GitHub](https://github.com/ProvableHQ/leo/issues/new).
+The Leo team maintains editor clients under [`ProvableHQ/leo-lsp-clients`](https://github.com/ProvableHQ/leo-lsp-clients) — every client launches the same `leo-lsp` server, so the capabilities above apply uniformly. If you do not see your favorite editor on this list, please reach out on [GitHub](https://github.com/ProvableHQ/leo/issues/new).
 
 ### VS Code
 
@@ -32,13 +34,21 @@ Download the editor here: <https://code.visualstudio.com/download>.
 
 #### Install
 
-1. Install [Leo for VSCode](https://marketplace.visualstudio.com/items?itemName=aleohq.leo-extension) from VSCode marketplace.
+1. Install [Leo for VSCode](https://marketplace.visualstudio.com/items?itemName=aleohq.leo-extension) from the VSCode marketplace.
 2. The correct extension ID is `aleohq.leo-extension`, and the description should state "the official VSCode extension for Leo".
 
 #### Usage
 
 1. Open `VSCode`.
 2. Go to Settings > Extensions or use the left side panel Extensions button to enable the Leo plugin.
+
+### Cursor
+
+[Cursor](https://www.cursor.com/) reuses the VSCode extension surface. The Leo client is implemented and pending publication to [Open VSX](https://open-vsx.org/); once published, install it from Cursor's Extensions panel by searching for "Leo". Progress is tracked in [leo-lsp-clients#10](https://github.com/ProvableHQ/leo-lsp-clients/issues/10).
+
+### Google Antigravity
+
+[Antigravity](https://antigravity.google) is also a VSCode-compatible host and is supported by the same client package. Like Cursor, the client is implemented and pending marketplace publication — track availability in [leo-lsp-clients#10](https://github.com/ProvableHQ/leo-lsp-clients/issues/10).
 
 ### Sublime Text
 

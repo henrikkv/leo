@@ -21,16 +21,20 @@
 //! .
 //! ├── program.json
 //! ├── build
-//! │   ├── imports
-//! │   │   └── credits.aleo
-//! │   └── main.aleo
-//! ├── outputs
-//! │   ├── program.TypeChecking.ast
-//! │   └── program.TypeChecking.json
+//! │   ├── my_program
+//! │   │   ├── my_program.aleo
+//! │   │   └── abi.json
+//! │   └── credits
+//! │       └── credits.aleo
 //! ├── src
 //! │   └── main.leo
 //! └── tests
 //!     └── test_something.leo
+//!
+//! Inside `build`, every compilation unit - the package's own program or
+//! library, its local dependencies, and fetched network imports - gets its own
+//! `build/<name>/` directory with the same shape. When compiler-debug AST
+//! snapshots are requested they appear under `build/<name>/snapshots/`.
 //!
 //! The file `program.json` is a manifest containing the program name, version, description,
 //! and license, together with information about its dependencies.
@@ -50,7 +54,7 @@
 //! ```no_run
 //! # use leo_ast::NetworkName;
 //! use leo_package::Package;
-//! let package = Package::from_directory("path/to/package", "/home/me/.aleo", false, false, Some(NetworkName::TestnetV0), Some("http://localhost:3030")).unwrap();
+//! let package = Package::from_directory("path/to/package", "/home/me/.aleo", false, false, Some(NetworkName::TestnetV0), Some("http://localhost:3030"), 3).unwrap();
 //! ```
 //! This will read the manifest and keep their data in `package.manifest`.
 //! It will also process dependencies and store them in topological order in `package.compilation_units`. This processing
@@ -67,8 +71,10 @@
 
 #![forbid(unsafe_code)]
 
+mod errors;
+
 use leo_ast::NetworkName;
-use leo_errors::{PackageError, Result, UtilError};
+use leo_errors::{Backtraced, Result};
 use leo_span::Symbol;
 
 use std::path::Path;
@@ -88,21 +94,25 @@ pub use package::*;
 mod compilation_unit;
 pub use compilation_unit::*;
 
+mod workspace;
+pub use workspace::*;
+
 pub const SOURCE_DIRECTORY: &str = "src";
 
 pub const MAIN_FILENAME: &str = "main.leo";
 
 pub const LIB_FILENAME: &str = "lib.leo";
 
-pub const IMPORTS_DIRECTORY: &str = "build/imports";
-
-pub const OUTPUTS_DIRECTORY: &str = "outputs";
-
 pub const BUILD_DIRECTORY: &str = "build";
 
 pub const ABI_FILENAME: &str = "abi.json";
 
-pub const INTERFACES_DIRECTORY: &str = "build/interfaces";
+/// Name of the per-unit subdirectory holding interface ABI JSON files.
+pub const INTERFACES_DIRNAME: &str = "interfaces";
+
+/// Name of the per-unit subdirectory holding compiler-debug AST snapshots.
+/// Created lazily on first write; absent on builds that don't request snapshots.
+pub const SNAPSHOTS_DIRNAME: &str = "snapshots";
 
 pub const TESTS_DIRECTORY: &str = "tests";
 
@@ -114,6 +124,15 @@ pub const MAX_PROGRAM_SIZE: usize =
 /// Edition 0 is the initial deployment, and increments with each upgrade.
 pub type Edition = u16;
 
+/// Strips a trailing `.aleo` (the Aleo program-ID suffix) from a compilation
+/// unit name, yielding the bare name.
+///
+/// `CompilationUnit` names are bare for local packages but `.aleo`-suffixed for
+/// network programs; build paths key on the bare name so the two are unified.
+pub fn bare_unit_name(name: &str) -> &str {
+    name.strip_suffix(".aleo").unwrap_or(name)
+}
+
 /// Converts a valid program or library name into a `Symbol`.
 ///
 /// Names must either end with `.aleo` or contain no periods; otherwise an error is returned.
@@ -121,7 +140,7 @@ fn symbol(name: &str) -> Result<Symbol> {
     if name.ends_with(".aleo") || !name.contains('.') {
         Ok(Symbol::intern(name))
     } else {
-        Err(PackageError::invalid_network_name(name).into())
+        Err(crate::errors::invalid_network_name(name).into())
     }
 }
 
@@ -241,11 +260,11 @@ pub fn retry_network_call<T, E: std::fmt::Display>(
 }
 
 // Fetch the given endpoint url and return the sanitized response.
-pub fn fetch_from_network(url: &str, network_retries: u32) -> Result<String, UtilError> {
+pub fn fetch_from_network(url: &str, network_retries: u32) -> Result<String, Backtraced> {
     fetch_from_network_plain(url, network_retries).map(|s| s.replace("\\n", "\n").replace('\"', ""))
 }
 
-pub fn fetch_from_network_plain(url: &str, network_retries: u32) -> Result<String, UtilError> {
+pub fn fetch_from_network_plain(url: &str, network_retries: u32) -> Result<String, Backtraced> {
     // Retry only on transport-level failures (connection errors, timeouts, etc.).
     // HTTP 3xx/4xx/5xx responses are not retried since they reflect persistent conditions.
     let agent = create_http_agent();
@@ -254,12 +273,12 @@ pub fn fetch_from_network_plain(url: &str, network_retries: u32) -> Result<Strin
             .get(url)
             .header("X-Leo-Version", env!("CARGO_PKG_VERSION"))
             .call()
-            .map_err(|e| UtilError::failed_to_retrieve_from_endpoint(url, e))
+            .map_err(|e| crate::errors::failed_to_retrieve_from_endpoint(url, e))
     })?;
     match response.status().as_u16() {
         200..=299 => Ok(response.body_mut().read_to_string().unwrap()),
-        301 => Err(UtilError::endpoint_moved_error(url)),
-        _ => Err(UtilError::network_error(url, response.status())),
+        301 => Err(crate::errors::endpoint_moved_error(url)),
+        _ => Err(crate::errors::network_error(url, response.status())),
     }
 }
 
@@ -270,7 +289,7 @@ pub fn fetch_program_from_network(
     endpoint: &str,
     network: NetworkName,
     network_retries: u32,
-) -> Result<String, UtilError> {
+) -> Result<String, Backtraced> {
     let url = format!("{endpoint}/{network}/program/{name}");
     let program = fetch_from_network(&url, network_retries)?;
     Ok(program)
@@ -285,19 +304,19 @@ pub fn fetch_latest_edition(
     endpoint: &str,
     network: NetworkName,
     network_retries: u32,
-) -> Result<Edition, UtilError> {
+) -> Result<Edition, Backtraced> {
     // Strip the .aleo suffix if present for the URL.
     let name_without_suffix = name.strip_suffix(".aleo").unwrap_or(name);
 
     let url = format!("{endpoint}/{network}/program/{name_without_suffix}.aleo/latest_edition");
     let contents = fetch_from_network(&url, network_retries)?;
-    contents
-        .parse::<u16>()
-        .map_err(|e| UtilError::failed_to_retrieve_from_endpoint(url, format!("Failed to parse edition as u16: {e}")))
+    contents.parse::<u16>().map_err(|e| {
+        crate::errors::failed_to_retrieve_from_endpoint(url, format!("Failed to parse edition as u16: {e}"))
+    })
 }
 
 // Verify that a fetched program is valid aleo instructions.
-pub fn verify_valid_program(name: &str, program: &str) -> Result<(), UtilError> {
+pub fn verify_valid_program(name: &str, program: &str) -> Result<(), Backtraced> {
     use snarkvm::prelude::{Program, TestnetV0};
     use std::str::FromStr as _;
 
@@ -305,13 +324,13 @@ pub fn verify_valid_program(name: &str, program: &str) -> Result<(), UtilError> 
     let program_size = program.len();
 
     if program_size > MAX_PROGRAM_SIZE {
-        return Err(UtilError::program_size_limit_exceeded(name, program_size, MAX_PROGRAM_SIZE));
+        return Err(crate::errors::program_size_limit_exceeded(name, program_size, MAX_PROGRAM_SIZE));
     }
 
     // Parse the program to verify it's valid Aleo instructions.
     match Program::<TestnetV0>::from_str(program) {
         Ok(_) => Ok(()),
-        Err(_) => Err(UtilError::snarkvm_parsing_error(name)),
+        Err(_) => Err(crate::errors::snarkvm_parsing_error(name)),
     }
 }
 

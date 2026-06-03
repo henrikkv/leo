@@ -21,7 +21,6 @@ This creates a directory with the following structure:
 ```bash
 hello/
 ├── .gitignore # A default `.gitignore` file for Leo projects
-├── .env # The environment, containing the `NETWORK` and `PRIVATE_KEY` variables.
 ├── program.json # The manifest for the Leo project
 ├── tests/
   └── test_hello.leo # The Leo source code for unit tests
@@ -88,7 +87,7 @@ The constructor acts as a gatekeeper for your program; the logic in the function
 All programs must have an explicitly declared constructor function.
 :::
 
-For now, we'll leave it as is, which will prevent upgrades from occurring. For more details on how program upgradability works, and different patterns for upgrading your programs, check out [Upgrading Programs](./../guides/09_program_upgradability.md).
+For now, we'll leave it as is, which will prevent upgrades from occurring. For more details on how program upgradability works, and different patterns for upgrading your programs, check out [Upgrading Programs](./../guides/10_program_upgradability.md).
 
 Now let's compile and run the program.
 
@@ -100,7 +99,7 @@ To compile the program, run:
 leo build
 ```
 
-On invoking the build command, Leo automatically creates a `build/⁠` and `output/`⁠ folder in the project directory. The compiled code is contained in the `build` directory. The `output` directory is used to store intermediate artifacts from compilation.
+On invoking the build command, Leo automatically creates a `build/⁠` folder in the project directory. Inside it, every program - your own program and each dependency - gets its own `build/{program}/` directory containing its compiled `.aleo` bytecode and ABI.
 
 The `leo run` command will both compile and run the specified program.
 In your terminal, run:
@@ -130,18 +129,17 @@ leo run main 1u32 2u32
 
 Running programs locally is great, but you'll likely want to actually deploy your programs and execute functions onchain. To do this, you'll need to use `leo deploy` for deployment and `leo execute` to execute functions and generate the transaction containing the requisite metadata and zero-knowledge proofs.
 
-We have dedicated guides for both [Deploying](./../guides/03_deploying.md) and [Executing](./../guides/04_executing.md), so please check those out for more information!
+We have dedicated guides for both [Deploying](./../guides/04_deploying.md) and [Executing](./../guides/05_executing.md), so please check those out for more information!
 
 ## Clean
 
-Finally, you can remove all build files and outputs with:
+Finally, you can remove all build artifacts with:
 
 ```bash
 leo clean
 ```
 
 ```bash title="console output:"
-Leo 🧹 Cleaned the outputs directory ./hello/outputs
 Leo 🧹 Cleaned the build directory ./hello/build
 ```
 

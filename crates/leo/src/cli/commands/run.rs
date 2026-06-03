@@ -101,7 +101,7 @@ impl Command for LeoRun {
         if let Some(package) = &input
             && package.compilation_units.last().is_some_and(|p| p.kind.is_library())
         {
-            return Err(CliError::custom("Cannot run a library package. Only programs can be run.").into());
+            return Err(crate::errors::custom("Cannot run a library package. Only programs can be run.").into());
         }
 
         // Get the network, defaulting to `TestnetV0` if none is specified.
@@ -163,7 +163,7 @@ fn handle_run<A: Aleo>(
                 command.name,
             ),
             None => {
-                return Err(CliError::custom(format!(
+                return Err(crate::errors::custom(format!(
                     "Running `leo execute {} ...`, without an explicit program name requires that your current working directory is a valid Leo project.",
                     command.name
                 )).into());
@@ -173,18 +173,14 @@ fn handle_run<A: Aleo>(
 
     // Parse the program name as a `ProgramID`.
     let program_id = ProgramID::<A::Network>::from_str(&program_name)
-        .map_err(|e| CliError::custom(format!("Failed to parse program name: {e}")))?;
+        .map_err(|e| crate::errors::custom(format!("Failed to parse program name: {e}")))?;
     // Parse the function name as an `Identifier`.
     let function_id = Identifier::<A::Network>::from_str(&function_name)
-        .map_err(|e| CliError::custom(format!("Failed to parse function name: {e}")))?;
+        .map_err(|e| crate::errors::custom(format!("Failed to parse function name: {e}")))?;
 
     // Get all the dependencies in the package if it exists.
     // Get the programs and optional manifests for all programs.
     let programs = if let Some(package) = &package {
-        // Get the package directories.
-        let build_directory = package.build_directory();
-        let imports_directory = package.imports_directory();
-        let source_directory = package.source_directory();
         // Get the program names and their bytecode.
         package
             .compilation_units
@@ -193,19 +189,18 @@ fn handle_run<A: Aleo>(
             .filter(|unit| !unit.kind.is_library())
             .map(|unit| {
                 let program_id = ProgramID::<A::Network>::from_str(&format!("{}", unit.name))
-                    .map_err(|e| CliError::custom(format!("Failed to parse program ID: {e}")))?;
+                    .map_err(|e| crate::errors::custom(format!("Failed to parse program ID: {e}")))?;
                 match &unit.data {
                     ProgramData::Bytecode(bytecode) => Ok((program_id, bytecode.to_string(), unit.edition)),
-                    ProgramData::SourcePath { source, .. } => {
+                    ProgramData::SourcePath { .. } => {
                         // Get the path to the built bytecode.
-                        let bytecode_path = if source.as_path() == source_directory.join("main.leo") {
-                            build_directory.join("main.aleo")
-                        } else {
-                            imports_directory.join(format!("{}", unit.name))
-                        };
+                        let bytecode_path = package.unit_bytecode_path(&unit.name.to_string());
                         // Fetch the bytecode.
                         let bytecode = std::fs::read_to_string(&bytecode_path).map_err(|e| {
-                            CliError::custom(format!("Failed to read bytecode at {}: {e}", bytecode_path.display()))
+                            crate::errors::custom(format!(
+                                "Failed to read bytecode at {}: {e}",
+                                bytecode_path.display()
+                            ))
                         })?;
                         // Return the bytecode and the manifest.
                         Ok((program_id, bytecode, unit.edition))
@@ -223,7 +218,7 @@ fn handle_run<A: Aleo>(
         .map(|(_, bytecode, edition)| {
             // Parse the program.
             let program = snarkvm::prelude::Program::<A::Network>::from_str(&bytecode)
-                .map_err(|e| CliError::custom(format!("Failed to parse program: {e}")))?;
+                .map_err(|e| crate::errors::custom(format!("Failed to parse program: {e}")))?;
             // Return the program and its name.
             Ok((program, edition))
         })
@@ -239,8 +234,19 @@ fn handle_run<A: Aleo>(
             .find(|(program, _)| program.id() == &program_id)
             .expect("Program should exist since it is local")
             .0;
+        // `view fn`s are read-only finalize-store reads; they have no transition semantics, so
+        // `leo run` (an in-memory simulation against an empty finalize store) can't produce a
+        // meaningful result. Detect this up front instead of falling through to the
+        // "function does not exist" branch below, which would mislead the user.
+        if program.contains_view(&function_id) {
+            return Err(crate::errors::custom(format!(
+                "`{function_name}` is a `view fn`; views are read-only and cannot be simulated by `leo run` \
+                 (which evaluates against an empty in-memory finalize store)."
+            ))
+            .into());
+        }
         if !program.contains_function(&function_id) {
-            return Err(CliError::custom(format!(
+            return Err(crate::errors::custom(format!(
                 "Function `{function_name}` does not exist in program `{program_name}`."
             ))
             .into());
@@ -251,7 +257,7 @@ fn handle_run<A: Aleo>(
         command.inputs.into_iter().map(|string| parse_input(&string, &private_key)).collect::<Result<Vec<_>>>()?;
 
     // Initialize an RNG.
-    let rng = &mut rand::thread_rng();
+    let rng = &mut rand::rng();
 
     // Initialize a new VM.
     let vm = VM::from(ConsensusStore::<A::Network, ConsensusMemory<A::Network>>::open(StorageMode::Production)?)?;
@@ -282,7 +288,7 @@ fn handle_run<A: Aleo>(
             (program, edition)
         })
         .collect::<Vec<_>>();
-    vm.process().write().add_programs_with_editions(&programs_and_editions)?;
+    vm.process().lock().add_programs_with_editions(&programs_and_editions)?;
 
     // Load any extra programs specified via `--with`.
     if !command.with.is_empty() {
@@ -300,12 +306,11 @@ fn handle_run<A: Aleo>(
     // Evaluate the program and get a response.
     let authorization = vm
         .authorize(&private_key, program_id, function_id, inputs.iter(), rng)
-        .map_err(|e| CliError::custom(format!("Failed to authorize execution: {e}")))?;
+        .map_err(|e| crate::errors::custom(format!("Failed to authorize execution: {e}")))?;
     let response = vm
         .process()
-        .read()
         .evaluate::<A>(authorization)
-        .map_err(|e| CliError::custom(format!("Failed to evaluate program: {e}")))?;
+        .map_err(|e| crate::errors::custom(format!("Failed to evaluate program: {e}")))?;
 
     // Collect outputs.
     let outputs: Vec<String> = response.outputs().iter().map(|o| o.to_string()).collect();

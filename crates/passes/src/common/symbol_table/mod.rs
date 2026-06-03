@@ -15,7 +15,7 @@
 // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
 
 use leo_ast::{Composite, Expression, Function, Interface, Location, NodeBuilder, NodeID, Path, Type};
-use leo_errors::{AstError, Color, Label, LeoError, Result};
+use leo_errors::{Color, Label, LeoError, Result};
 use leo_span::{Span, Symbol};
 
 use indexmap::{IndexMap, IndexSet};
@@ -283,18 +283,16 @@ impl SymbolTable {
         if self.is_visible(current_unit, &location.program) { self.functions.get(location) } else { None }
     }
 
-    /// Returns true if `location` refers to an entry point in a different compilation unit than
-    /// `current_unit`. Cross-unit entry-point calls must be emitted as direct Aleo `call`
-    /// instructions — inlining an entry-point body into a different compilation unit would lose
-    /// its transition semantics (record creation, signing, finalize scheduling).
-    pub fn is_cross_program_entry(&self, current_unit: Symbol, location: &Location) -> bool {
+    /// Returns true if `location` refers to an externally-callable function in a different
+    /// compilation unit than `current_unit` (i.e. must remain a direct Aleo `call`).
+    pub fn is_cross_program_call_target(&self, current_unit: Symbol, location: &Location) -> bool {
         location.program != current_unit
             && self
                 .lookup_function(current_unit, location)
                 .expect("the symbol table must know about every callee at this stage")
                 .function
                 .variant
-                .is_entry()
+                .is_externally_callable()
     }
 
     /// Access an interface by this name if it exists and is accessible from the compilation unit `current_unit`.
@@ -559,9 +557,9 @@ impl SymbolTable {
     }
 
     pub fn emit_shadow_error(name: Symbol, span: Span, prev_span: Span) -> LeoError {
-        AstError::name_defined_multiple_times(name, span, vec![
-            Label::new(format!("previous definition of `{name}` here"), prev_span).with_color(Color::Blue),
-            Label::new(format!("`{name}` redefined here"), span),
+        crate::errors::ast::name_defined_multiple_times(name, span, vec![
+            Label::new(prev_span).with_message(format!("previous definition of `{name}` here")).with_color(Color::Blue),
+            Label::new(span).with_message(format!("`{name}` redefined here")),
         ])
         .into()
     }
@@ -623,7 +621,7 @@ impl SymbolTable {
             func.finalizer = Some(Finalizer { location: callee_location, future_inputs, inferred_inputs });
             Ok(())
         } else {
-            Err(AstError::function_not_found(caller.path.iter().format("::")).into())
+            Err(crate::errors::ast::function_not_found(caller.path.iter().format("::")).into())
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "leo-lsp"
-version = "4.0.2"
+version = "4.1.0"
 authors = [ "The Leo Team <leo@provable.com>" ]
 description = "Language Server Protocol implementation for Leo"
 homepage = "https://leo-lang.org"
@@ -25,6 +25,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow             = { workspace = true }
+clap               = { workspace = true }
 crossbeam-channel  = { workspace = true }
 indexmap           = { workspace = true }
 leo-ast            = { workspace = true }
@@ -40,7 +41,9 @@ lsp-types          = { workspace = true }
 serde_json         = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+xxhash-rust        = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
-tempfile   = { workspace = true }
+crossbeam-channel = { workspace = true }
+serde_json        = { workspace = true }
+tempfile          = { workspace = true }

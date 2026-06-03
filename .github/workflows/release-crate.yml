@@ -10,10 +10,16 @@ on:
     inputs:
       tag:
         description: >-
-          Tag to release (e.g. leo-lang-v4.0.1, leo-fmt-v1.0.0). Uses the
-          crate name from Cargo.toml, not the binary name. Creates the git
-          tag if it doesn't already exist.
+          Tag to release (e.g. leo-lang-v4.0.1, leo-fmt-v1.0.0). Manual
+          dispatch creates the tag if it is missing, for crates.io-published
+          backfills.
         required: true
+
+# Serialize runs for the same tag. Avoids races between automated dispatch
+# from publish-crates.yml and manual backfills / reruns for the same release.
+concurrency:
+  group: release-crate-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   RUST_BACKTRACE: 0
@@ -29,6 +35,8 @@ jobs:
       crate-name: ${{ steps.parse.outputs.crate-name }}
       version: ${{ steps.parse.outputs.version }}
       bins: ${{ steps.find.outputs.bins }}
+      has-bins: ${{ steps.find.outputs.has-bins }}
+      previous-tag: ${{ steps.previous.outputs.previous-tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,10 +54,31 @@ jobs:
             echo "::error::Failed to parse tag '$TAG'"
             exit 1
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "crate-name=$CRATE_NAME" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$TAG"
+            echo "crate-name=$CRATE_NAME"
+            echo "version=$VERSION"
+          } >> "$GITHUB_OUTPUT"
           echo "Parsed tag: crate=$CRATE_NAME version=$VERSION"
+
+      - name: Resolve Release Ref
+        id: ref
+        run: |
+          TAG="${{ steps.parse.outputs.tag }}"
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            git checkout --detach "$TAG"
+            {
+              echo "tag-exists=true"
+              echo "release-commit=$(git rev-parse HEAD)"
+            } >> "$GITHUB_OUTPUT"
+            echo "Using existing tag $TAG"
+          else
+            {
+              echo "tag-exists=false"
+              echo "release-commit=$(git rev-parse HEAD)"
+            } >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG does not exist; manual dispatch will create it after validation."
+          fi
 
       - name: Find Crate
         id: find
@@ -77,30 +106,65 @@ jobs:
             exit 1
           fi
 
-          # Collect all [[bin]] names from this crate.
-          BINS="$(grep -A5 '^\[\[bin\]\]' "$FOUND" | grep '^name' | sed 's/.*= *"\(.*\)"/\1/' | tr '\n' ' ' | xargs)"
+          # Collect all [[bin]] names from this crate. Section-aware so
+          # neighbouring tables like [[test]] do not leak into the result.
+          BINS="$(awk -F'"' '
+            /^\[\[bin\]\]/ { in_bin = 1; next }
+            /^\[/          { in_bin = 0; next }
+            in_bin && /^name[[:space:]]*=/ { print $2 }
+          ' "$FOUND" | tr '\n' ' ' | xargs)"
           if [ -z "$BINS" ]; then
-            echo "::error::No [[bin]] entries found in $FOUND"
-            exit 1
+            {
+              echo "bins="
+              echo "has-bins=false"
+            } >> "$GITHUB_OUTPUT"
+            echo "No [[bin]] entries found in $FOUND; no release artifacts to build."
+            exit 0
           fi
 
-          echo "bins=$BINS" >> "$GITHUB_OUTPUT"
+          {
+            echo "bins=$BINS"
+            echo "has-bins=true"
+          } >> "$GITHUB_OUTPUT"
           echo "Found crate: dir=$(dirname "$FOUND") bins=$BINS"
 
       - name: Ensure Tag Exists
+        if: steps.find.outputs.has-bins == 'true'
         run: |
           TAG="${{ steps.parse.outputs.tag }}"
-          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+          if [ "${{ steps.ref.outputs.tag-exists }}" = "true" ]; then
             echo "Tag $TAG already exists"
           else
             echo "Creating tag $TAG"
-            git tag "$TAG"
-            git push origin "$TAG"
+            git tag "$TAG" "${{ steps.ref.outputs.release-commit }}"
+            git push origin "refs/tags/$TAG"
+          fi
+
+      - name: Skip Non-Binary Crate
+        if: steps.find.outputs.has-bins != 'true'
+        run: echo "Skipping ${{ steps.parse.outputs.tag }} because ${{ steps.parse.outputs.crate-name }} has no binary targets."
+
+      - name: Find Previous Tag
+        id: previous
+        if: steps.find.outputs.has-bins == 'true'
+        run: |
+          TAG="${{ steps.parse.outputs.tag }}"
+          CRATE_NAME="${{ steps.parse.outputs.crate-name }}"
+          PREVIOUS_TAG="$(
+            git tag --list "${CRATE_NAME}-v[0-9]*" --sort=-v:refname \
+              | awk -v current="$TAG" 'seen { print; exit } $0 == current { seen = 1 }'
+          )"
+          echo "previous-tag=$PREVIOUS_TAG" >> "$GITHUB_OUTPUT"
+          if [ -n "$PREVIOUS_TAG" ]; then
+            echo "Previous same-crate tag: $PREVIOUS_TAG"
+          else
+            echo "No previous same-crate tag found"
           fi
 
   build:
     name: Build (${{ matrix.target }})
     needs: prepare
+    if: needs.prepare.outputs.has-bins == 'true'
     strategy:
       fail-fast: true
       matrix:
@@ -177,12 +241,21 @@ jobs:
             bash -lc "
               rustup target add x86_64-unknown-linux-musl &&
               cd /home/rust/src &&
+              # The RocksDB version pulled in transitively (via snarkVM) predates
+              # GCC 13, which stopped transitively including <cstdint>; force it so
+              # the bundled C++ compiles. Append to the image's hardening flags.
+              # Remove once snarkVM bumps `rocksdb` past `librocksdb-sys 0.11`
+              # (tracked upstream by the snarkVM `rocksdb` bump PR).
+              export TARGET_CXXFLAGS=\"\$TARGET_CXXFLAGS -include cstdint\" &&
               cargo build \
                 --package ${{ needs.prepare.outputs.crate-name }} \
                 --target x86_64-unknown-linux-musl \
                 --release --locked \
                 ${{ steps.flags.outputs.features }}
             "
+          # Container writes outputs as its own user; reclaim ownership so
+          # subsequent host steps (strip, zip) can write into target/.
+          sudo chown -R "$(id -u):$(id -g)" target
 
       - name: Collect Binaries
         id: bins
@@ -227,9 +300,46 @@ jobs:
           name: release-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
 
+  metadata:
+    name: Generate Release Metadata
+    needs: prepare
+    if: needs.prepare.outputs.has-bins == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Generate Metadata
+        shell: bash
+        run: bash scripts/generate-release-metadata.sh "${{ needs.prepare.outputs.tag }}"
+        env:
+          PREVIOUS_TAG: ${{ needs.prepare.outputs.previous-tag }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-metadata
+          path: |
+            release-body.md
+            leo-release.toml
+
   release:
     name: Publish Release
-    needs: [prepare, build]
+    needs: [prepare, build, metadata]
+    if: needs.prepare.outputs.has-bins == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -241,10 +351,29 @@ jobs:
           merge-multiple: true
 
       - name: Create Release
+        if: needs.prepare.outputs.previous-tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: "${{ needs.prepare.outputs.crate-name }} v${{ needs.prepare.outputs.version }}"
-          files: "*.zip"
+          body_path: release-body.md
+          generate_release_notes: true
+          previous_tag: ${{ needs.prepare.outputs.previous-tag }}
+          files: |
+            *.zip
+            leo-release.toml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create First Release
+        if: needs.prepare.outputs.previous-tag == ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: "${{ needs.prepare.outputs.crate-name }} v${{ needs.prepare.outputs.version }}"
+          body_path: release-body.md
+          files: |
+            *.zip
+            leo-release.toml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,6 +1,6 @@
 [package]
 name = "leo-ast"
-version = "4.0.2"
+version = "4.1.0"
 authors = [ "The Leo Team <leo@provable.com>" ]
 description = "Abstract syntax tree (AST) for the Leo programming language"
 homepage = "https://leo-lang.org"
@@ -36,13 +36,5 @@ snarkvm         = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = [ "js" ] }
-snarkvm-console = { version = "=4.6.1", default-features = false, features = [
-  "account",
-  "program",
-  "types",
-  "dev_skip_checks",
-  "test_consensus_heights",
-  "test_targets",
-  "wasm",
-] }
-snarkvm-synthesizer-program = { version = "=4.6.1", features = [ "wasm" ] }
+snarkvm-console = { workspace = true }
+snarkvm-synthesizer-program = { workspace = true }

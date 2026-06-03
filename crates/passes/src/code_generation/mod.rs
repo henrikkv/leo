@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::{CompiledPrograms, Pass};
+use crate::{Bytecode, CompiledPrograms, Pass};
 
 use itertools::Itertools;
 use leo_ast::{Ast, Mode, ProgramId};
@@ -44,11 +44,41 @@ use snarkvm::{
 };
 use visitor::*;
 
+/// The structured output of code generation, before serialization.
+#[derive(Default)]
+pub struct GeneratedPrograms {
+    pub primary: Option<AleoProgram>,
+    pub imports: Vec<(String, AleoProgram)>,
+}
+
+impl GeneratedPrograms {
+    /// Serializes all programs to bytecode strings.
+    pub fn into_compiled(self) -> CompiledPrograms {
+        let primary_bytecode = self.primary.map(|p| p.to_string()).unwrap_or_default();
+        let import_bytecodes = self
+            .imports
+            .into_iter()
+            .map(|(name, program)| Bytecode { program_name: name, bytecode: program.to_string() })
+            .collect();
+        CompiledPrograms { primary_bytecode, import_bytecodes }
+    }
+
+    /// Returns mutable references to all statement lists across all functions/closures/finalizes/constructors.
+    pub fn for_each_statement_list(&mut self, mut f: impl FnMut(&mut Vec<AleoStmt>, usize)) {
+        for (_, program) in &mut self.imports {
+            program.for_each_statement_list(&mut f);
+        }
+        if let Some(primary) = &mut self.primary {
+            primary.for_each_statement_list(&mut f);
+        }
+    }
+}
+
 pub struct CodeGenerating;
 
 impl Pass for CodeGenerating {
     type Input = ();
-    type Output = CompiledPrograms;
+    type Output = GeneratedPrograms;
 
     const NAME: &str = "CodeGenerating";
 
@@ -86,6 +116,35 @@ pub struct AleoProgram {
     mappings: Vec<AleoMapping>,
     functions: Vec<AleoFunctional>,
     constructor: Option<AleoConstructor>,
+}
+
+impl AleoProgram {
+    /// Calls `f` for each statement list in the program (closures, functions, finalizes, constructor).
+    /// The second argument to `f` is the number of input registers for that function.
+    pub fn for_each_statement_list(&mut self, f: &mut impl FnMut(&mut Vec<AleoStmt>, usize)) {
+        for functional in &mut self.functions {
+            match functional {
+                AleoFunctional::Closure(c) => {
+                    f(&mut c.statements, c.inputs.len());
+                }
+                AleoFunctional::Function(fun) => {
+                    f(&mut fun.statements, fun.inputs.len());
+                    if let Some(fin) = &mut fun.finalize {
+                        f(&mut fin.statements, fin.inputs.len());
+                    }
+                }
+                AleoFunctional::Finalize(fin) => {
+                    f(&mut fin.statements, fin.inputs.len());
+                }
+                AleoFunctional::View(v) => {
+                    f(&mut v.statements, v.inputs.len());
+                }
+            }
+        }
+        if let Some(constructor) = &mut self.constructor {
+            f(&mut constructor.statements, 0);
+        }
+    }
 }
 
 impl Display for AleoProgram {
@@ -148,7 +207,7 @@ impl Display for AleoRecord {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AleoVisibility {
     Constant,
     Public,
@@ -224,6 +283,7 @@ pub enum AleoFunctional {
     Closure(AleoClosure),
     Function(AleoFunction),
     Finalize(AleoFinalize),
+    View(AleoView),
 }
 impl AleoFunctional {
     pub fn as_closure(self) -> AleoClosure {
@@ -248,7 +308,36 @@ impl Display for AleoFunctional {
             Self::Closure(c) => c.fmt(f),
             Self::Function(fun) => fun.fmt(f),
             Self::Finalize(fin) => fin.fmt(f),
+            Self::View(v) => v.fmt(f),
         }
+    }
+}
+
+/// An Aleo `view` block — a read-only entry point introduced in V15.
+/// Bytecode shape:
+///
+/// ```aleo
+/// view <name>:
+///     input r0 as <type>.public;
+///     ...
+///     output r1 as <type>.public;
+/// ```
+#[derive(Debug)]
+pub struct AleoView {
+    name: String,
+    inputs: Vec<AleoInput>,
+    statements: Vec<AleoStmt>,
+}
+impl Display for AleoView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "view {}:", self.name)?;
+        for input in &self.inputs {
+            write!(f, "{}", input)?;
+        }
+        for stm in &self.statements {
+            write!(f, "{}", stm)?;
+        }
+        Ok(())
     }
 }
 
@@ -382,7 +471,7 @@ impl Display for AleoExpr {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AleoStmt {
     Output(AleoExpr, AleoType, Option<AleoVisibility>),
     AssertEq(AleoExpr, AleoExpr),
@@ -490,11 +579,7 @@ impl Display for AleoStmt {
                 writeln!(f, "    ternary {cond} {if_true} {if_false} into {dest};")
             }
             Self::Commit(variant, arg0, arg1, dest, type_) => {
-                writeln!(
-                    f,
-                    "    {} {arg0} {arg1} into {dest} as {type_};",
-                    CommitVariant::opcode(variant.clone() as u8)
-                )
+                writeln!(f, "    {} {arg0} {arg1} into {dest} as {type_};", CommitVariant::opcode(*variant as u8))
             }
             Self::Hash(variant, arg0, dest, type_) => {
                 writeln!(f, "    {} {arg0} into {dest} as {type_};", variant.opcode())
@@ -626,7 +711,7 @@ impl Display for AleoStmt {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AleoType {
     Future { name: String, program: String },
     Record { name: String, program: Option<String> },

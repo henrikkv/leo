@@ -1,3 +1,10 @@
+[WTYC0372006] Warning: comparison `==` between two operands of type `()` always evaluates to `true` at compile time
+   ╭─[ compiler-test:5:31 ]
+   │
+ 5 │         return final { assert(Mapping::set(m, 0u32, 0u32) == Mapping::set(m, 0u32, 0u32)); };
+   │ 
+   │ Help: Both operands are unit values (e.g. the return of `Mapping::set` or other side-effecting calls), so the comparison has no runtime effect. If you meant to compare values, change the operands to expressions that produce non-unit values.
+───╯
 program test.aleo;
 
 mapping m:
@@ -11,4 +18,3 @@ function foo:
 finalize foo:
     set 0u32 into m[0u32];
     set 0u32 into m[0u32];
-    assert.eq true true;

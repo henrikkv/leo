@@ -16,8 +16,8 @@
 
 use crate::CompilerState;
 
-use leo_ast::{Expression, Location, Node, NodeID, const_eval::Value};
-use leo_errors::StaticAnalyzerError;
+use leo_ast::{Expression, FromStrRadix, Literal, LiteralVariant, Location, Node, NodeID, const_eval::Value};
+use leo_errors::Formatted;
 use leo_span::{Span, Symbol};
 
 use indexmap::IndexMap;
@@ -46,9 +46,53 @@ pub fn is_atom(expr: &Expression) -> bool {
     matches!(expr, Expression::Path(_) | Expression::Literal(_))
 }
 
+/// Parse a numeric literal string, handling underscores and radix prefixes (0x, 0o, 0b).
+fn parse_literal_value(s: &str) -> Option<i128> {
+    let clean = s.replace('_', "");
+    i128::from_str_by_radix(&clean).ok()
+}
+
+/// Check if a literal represents the zero/identity value for addition.
+pub fn is_zero_literal(lit: &Literal) -> bool {
+    match &lit.variant {
+        LiteralVariant::Integer(_, s)
+        | LiteralVariant::Field(s)
+        | LiteralVariant::Group(s)
+        | LiteralVariant::Scalar(s)
+        | LiteralVariant::Unsuffixed(s) => parse_literal_value(s) == Some(0),
+        LiteralVariant::Boolean(b) => !b,
+        _ => false,
+    }
+}
+
+/// Check if a literal represents the one/identity value for multiplication.
+pub fn is_one_literal(lit: &Literal) -> bool {
+    match &lit.variant {
+        LiteralVariant::Integer(_, s)
+        | LiteralVariant::Field(s)
+        | LiteralVariant::Scalar(s)
+        | LiteralVariant::Unsuffixed(s) => parse_literal_value(s) == Some(1),
+        LiteralVariant::Boolean(b) => *b,
+        _ => false,
+    }
+}
+
+/// Check if two expressions refer to the same SSA variable.
+/// In SSA form, each variable name is unique, so name equality implies value equality.
+pub fn same_ssa_atom(a: &Expression, b: &Expression) -> bool {
+    match (a, b) {
+        (Expression::Path(pa), Expression::Path(pb)) => {
+            let sa = pa.try_local_symbol();
+            let sb = pb.try_local_symbol();
+            sa == sb && sa.is_some()
+        }
+        _ => false,
+    }
+}
+
 impl SsaConstPropagationVisitor<'_> {
     /// Emit a `StaticAnalyzerError`.
-    pub fn emit_err(&self, err: StaticAnalyzerError) {
+    pub fn emit_err(&self, err: Formatted) {
         self.state.handler.emit_err(err);
     }
 

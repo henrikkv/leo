@@ -17,7 +17,7 @@
 use crate::*;
 
 use leo_ast::DiGraph;
-use leo_errors::{CliError, PackageError, Result, UtilError};
+use leo_errors::Result;
 use leo_span::Symbol;
 
 use indexmap::{IndexMap, map::Entry};
@@ -59,16 +59,51 @@ pub struct Package {
 }
 
 impl Package {
-    pub fn outputs_directory(&self) -> PathBuf {
-        self.base_directory.join(OUTPUTS_DIRECTORY)
-    }
-
-    pub fn imports_directory(&self) -> PathBuf {
-        self.base_directory.join(IMPORTS_DIRECTORY)
-    }
-
+    /// The root of the build directory.
+    ///
+    /// This is the single place that knows where build artifacts are rooted;
+    /// every per-unit path below is composed from it.
     pub fn build_directory(&self) -> PathBuf {
         self.base_directory.join(BUILD_DIRECTORY)
+    }
+
+    /// The package's own compilation unit, identified via the manifest.
+    /// Robust under `--build-tests` (unlike `compilation_units.last()`).
+    pub fn primary_unit(&self) -> Option<&CompilationUnit> {
+        let primary = bare_unit_name(&self.manifest.program);
+        self.compilation_units.iter().find(|u| !u.kind.is_test() && bare_unit_name(&u.name.to_string()) == primary)
+    }
+
+    /// The `build/<name>/` directory for a single compilation unit - a program,
+    /// library, or test - whether it is this package's own unit, a local
+    /// dependency, or a fetched network import.
+    pub fn unit_build_directory(&self, name: &str) -> PathBuf {
+        self.build_directory().join(bare_unit_name(name))
+    }
+
+    /// Path to a unit's compiled Aleo bytecode: `build/<name>/<name>.aleo`.
+    /// Only programs and tests produce bytecode; libraries do not.
+    pub fn unit_bytecode_path(&self, name: &str) -> PathBuf {
+        let bare = bare_unit_name(name);
+        self.unit_build_directory(name).join(format!("{bare}.aleo"))
+    }
+
+    /// Path to a unit's Leo ABI: `build/<name>/abi.json`.
+    pub fn unit_abi_path(&self, name: &str) -> PathBuf {
+        self.unit_build_directory(name).join(ABI_FILENAME)
+    }
+
+    /// Path to a unit's interface ABI directory: `build/<name>/interfaces/`.
+    /// Both programs and libraries can declare interfaces.
+    pub fn unit_interfaces_directory(&self, name: &str) -> PathBuf {
+        self.unit_build_directory(name).join(INTERFACES_DIRNAME)
+    }
+
+    /// Path to a unit's AST-snapshot directory: `build/<name>/snapshots/`.
+    /// Populated only when a snapshot CLI flag is set; created lazily by the
+    /// compiler on the first write, so absent on builds that don't request snapshots.
+    pub fn unit_snapshots_directory(&self, name: &str) -> PathBuf {
+        self.unit_build_directory(name).join(SNAPSHOTS_DIRNAME)
     }
 
     pub fn source_directory(&self) -> PathBuf {
@@ -87,7 +122,7 @@ impl Package {
     fn initialize_impl(package_name: &str, path: &Path, is_library: bool) -> Result<PathBuf> {
         let package_name = if is_library {
             if !crate::is_valid_library_name(package_name) {
-                return Err(CliError::invalid_package_name("library", package_name).into());
+                return Err(crate::errors::cli_invalid_package_name("library", package_name).into());
             }
 
             package_name.to_string()
@@ -96,36 +131,36 @@ impl Package {
                 if package_name.ends_with(".aleo") { package_name.to_string() } else { format!("{package_name}.aleo") };
 
             if !crate::is_valid_program_name(&program_name) {
-                return Err(CliError::invalid_package_name("program", &program_name).into());
+                return Err(crate::errors::cli_invalid_package_name("program", &program_name).into());
             }
 
             program_name
         };
 
-        let path = path.canonicalize().map_err(|e| PackageError::failed_path(path.display(), e))?;
+        let path = path.canonicalize().map_err(|e| crate::errors::failed_path(path.display(), e))?;
         let full_path = path.join(package_name.strip_suffix(".aleo").unwrap_or(&package_name));
 
         // Verify that there is no existing directory at the path.
         if full_path.exists() {
             return Err(
-                PackageError::failed_to_initialize_package(package_name, &path, "Directory already exists").into()
+                crate::errors::failed_to_initialize_package(package_name, &path, "Directory already exists").into()
             );
         }
 
         // Create the package directory.
         std::fs::create_dir(&full_path)
-            .map_err(|e| PackageError::failed_to_initialize_package(&package_name, &full_path, e))?;
+            .map_err(|e| crate::errors::failed_to_initialize_package(&package_name, &full_path, e))?;
 
         // Change the current working directory to the package directory.
         std::env::set_current_dir(&full_path)
-            .map_err(|e| PackageError::failed_to_initialize_package(&package_name, &full_path, e))?;
+            .map_err(|e| crate::errors::failed_to_initialize_package(&package_name, &full_path, e))?;
 
         // Create .gitignore
-        const GITIGNORE_TEMPLATE: &str = ".env\n*.avm\n*.prover\n*.verifier\noutputs/\n";
+        const GITIGNORE_TEMPLATE: &str = ".env\n*.avm\n*.prover\n*.verifier\nbuild/\n";
         const GITIGNORE_FILENAME: &str = ".gitignore";
 
         let gitignore_path = full_path.join(GITIGNORE_FILENAME);
-        std::fs::write(gitignore_path, GITIGNORE_TEMPLATE).map_err(PackageError::io_error_gitignore_file)?;
+        std::fs::write(gitignore_path, GITIGNORE_TEMPLATE).map_err(crate::errors::io_error_gitignore_file)?;
 
         // Create manifest
         let manifest = Manifest {
@@ -145,7 +180,7 @@ impl Package {
         let source_path = full_path.join(SOURCE_DIRECTORY);
 
         std::fs::create_dir(&source_path)
-            .map_err(|e| PackageError::failed_to_create_source_directory(source_path.display(), e))?;
+            .map_err(|e| crate::errors::failed_to_create_source_directory(source_path.display(), e))?;
 
         let name_no_aleo = package_name.strip_suffix(".aleo").unwrap_or(&package_name);
 
@@ -154,38 +189,38 @@ impl Package {
             let lib_path = source_path.join("lib.leo");
 
             std::fs::write(&lib_path, lib_template(name_no_aleo)).map_err(|e| {
-                UtilError::util_file_io_error(format_args!("Failed to write `{}`", lib_path.display()), e)
+                crate::errors::util_file_io_error(format_args!("Failed to write `{}`", lib_path.display()), e)
             })?;
 
             // Create tests directory with a starter test file.
             let tests_path = full_path.join(TESTS_DIRECTORY);
 
             std::fs::create_dir(&tests_path)
-                .map_err(|e| PackageError::failed_to_create_source_directory(tests_path.display(), e))?;
+                .map_err(|e| crate::errors::failed_to_create_source_directory(tests_path.display(), e))?;
 
             let test_file_path = tests_path.join(format!("test_{name_no_aleo}.leo"));
 
             std::fs::write(&test_file_path, lib_test_template(name_no_aleo)).map_err(|e| {
-                UtilError::util_file_io_error(format_args!("Failed to write `{}`", test_file_path.display()), e)
+                crate::errors::util_file_io_error(format_args!("Failed to write `{}`", test_file_path.display()), e)
             })?;
         } else {
             // Create main.leo
             let main_path = source_path.join(MAIN_FILENAME);
 
             std::fs::write(&main_path, main_template(name_no_aleo)).map_err(|e| {
-                UtilError::util_file_io_error(format_args!("Failed to write `{}`", main_path.display()), e)
+                crate::errors::util_file_io_error(format_args!("Failed to write `{}`", main_path.display()), e)
             })?;
 
             // Create tests directory
             let tests_path = full_path.join(TESTS_DIRECTORY);
 
             std::fs::create_dir(&tests_path)
-                .map_err(|e| PackageError::failed_to_create_source_directory(tests_path.display(), e))?;
+                .map_err(|e| crate::errors::failed_to_create_source_directory(tests_path.display(), e))?;
 
             let test_file_path = tests_path.join(format!("test_{name_no_aleo}.leo"));
 
             std::fs::write(&test_file_path, test_template(name_no_aleo)).map_err(|e| {
-                UtilError::util_file_io_error(format_args!("Failed to write `{}`", test_file_path.display()), e)
+                crate::errors::util_file_io_error(format_args!("Failed to write `{}`", test_file_path.display()), e)
             })?;
         }
 
@@ -271,14 +306,6 @@ impl Package {
         data.into_iter()
     }
 
-    pub fn import_files(&self) -> impl Iterator<Item = PathBuf> {
-        let path = self.imports_directory();
-        // This allocation isn't ideal but it's not performance critical and
-        // easily resolves lifetime issues.
-        let data: Vec<PathBuf> = Self::files_with_extension(&path, "aleo").collect();
-        data.into_iter()
-    }
-
     fn files_with_extension(path: &Path, extension: &'static str) -> impl Iterator<Item = PathBuf> {
         path.read_dir()
             .ok()
@@ -305,7 +332,7 @@ impl Package {
         network_retries: u32,
     ) -> Result<Self> {
         let map_err = |path: &Path, err| {
-            UtilError::util_file_io_error(format_args!("Trying to find path at {}", path.display()), err)
+            crate::errors::util_file_io_error(format_args!("Trying to find path at {}", path.display()), err)
         };
 
         let path = path.canonicalize().map_err(|err| map_err(path, err))?;
@@ -366,7 +393,7 @@ impl Package {
             }
 
             let ordered_dependency_symbols =
-                digraph.post_order().map_err(|_| UtilError::circular_dependency_error())?;
+                digraph.post_order().map_err(|_| crate::errors::circular_dependency_error())?;
 
             (
                 ordered_dependency_symbols.into_iter().map(|symbol| map.swap_remove(&symbol).unwrap().1).collect(),
@@ -405,7 +432,7 @@ impl Package {
                     || new.path != existing_dep.path
                     || new.edition != existing_dep.edition
                 {
-                    return Err(PackageError::conflicting_dependency(existing_dep, new).into());
+                    return Err(crate::errors::conflicting_dependency(existing_dep, new).into());
                 }
                 return Ok(());
             }
@@ -441,6 +468,13 @@ impl Package {
                             no_cache,
                             network_retries,
                         )?
+                    }
+                    (_, Location::Workspace) => {
+                        return Err(anyhow!(
+                            "Workspace dependency `{}` was not resolved before graph building. This is a compiler bug.",
+                            new.name
+                        )
+                        .into());
                     }
                     _ => return Err(anyhow!("Invalid dependency data for {} (path must be given).", new.name).into()),
                 };
@@ -574,6 +608,8 @@ fn collect_declared_deps_recursive(
         if include_dev { manifest.dev_dependencies.iter().flatten().collect() } else { Vec::new() };
     for dep in deps.chain(dev) {
         let dep = canonicalize_dependency_path_relative_to(base_path, dep.clone())?;
+        // Resolve workspace deps early - converts to Location::Local with an absolute path.
+        let dep = if dep.location == Location::Workspace { resolve_workspace_dependency(base_path, dep)? } else { dep };
         let sym = symbol(&dep.name)?;
         // Only recurse into newly discovered dependencies to avoid infinite
         // recursion on circular manifests (cycles are caught later by
@@ -594,4 +630,64 @@ fn collect_declared_deps_recursive(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_package(base: &str) -> Package {
+        Package {
+            base_directory: PathBuf::from(base),
+            compilation_units: Vec::new(),
+            manifest: Manifest {
+                program: "demo.aleo".to_string(),
+                version: "0.1.0".to_string(),
+                description: String::new(),
+                license: "MIT".to_string(),
+                leo: "0.0.0".to_string(),
+                dependencies: None,
+                dev_dependencies: None,
+            },
+            dep_graph: DiGraph::default(),
+        }
+    }
+
+    #[test]
+    fn bare_unit_name_strips_aleo_suffix() {
+        assert_eq!(crate::bare_unit_name("token.aleo"), "token");
+        assert_eq!(crate::bare_unit_name("token"), "token");
+        assert_eq!(crate::bare_unit_name("credits.aleo"), "credits");
+    }
+
+    #[test]
+    fn unit_paths_are_keyed_by_bare_name() {
+        let pkg = dummy_package("/tmp/demo");
+        // The directory key is the bare compilation unit name, accepting input
+        // with or without the `.aleo` suffix.
+        assert_eq!(pkg.unit_build_directory("token.aleo"), PathBuf::from("/tmp/demo/build/token"));
+        assert_eq!(pkg.unit_build_directory("token"), PathBuf::from("/tmp/demo/build/token"));
+        assert_eq!(pkg.unit_bytecode_path("token.aleo"), PathBuf::from("/tmp/demo/build/token/token.aleo"));
+        assert_eq!(pkg.unit_abi_path("token"), PathBuf::from("/tmp/demo/build/token/abi.json"));
+        assert_eq!(pkg.unit_interfaces_directory("token"), PathBuf::from("/tmp/demo/build/token/interfaces"));
+        assert_eq!(pkg.unit_snapshots_directory("token"), PathBuf::from("/tmp/demo/build/token/snapshots"));
+    }
+
+    #[test]
+    fn libraries_are_keyed_like_programs() {
+        // A library is keyed by its name exactly like a program: a library
+        // `my_lib` declaring interfaces gets `build/my_lib/interfaces/`.
+        let pkg = dummy_package("/tmp/demo");
+        assert_eq!(pkg.unit_build_directory("my_lib"), PathBuf::from("/tmp/demo/build/my_lib"));
+        assert_eq!(pkg.unit_interfaces_directory("my_lib"), PathBuf::from("/tmp/demo/build/my_lib/interfaces"));
+    }
+
+    #[test]
+    fn build_directory_is_the_single_root() {
+        let pkg = dummy_package("/tmp/demo");
+        assert_eq!(pkg.build_directory(), PathBuf::from("/tmp/demo/build"));
+        // Every per-unit path is rooted at `build_directory()`, the single layout seam.
+        assert!(pkg.unit_bytecode_path("x").starts_with(pkg.build_directory()));
+        assert!(pkg.unit_interfaces_directory("credits.aleo").starts_with(pkg.build_directory()));
+    }
 }

@@ -18,8 +18,7 @@ use super::*;
 
 use leo_ast::{NetworkName, NodeBuilder, Program, Stub};
 use leo_compiler::{AstSnapshots, Compiled, Compiler, CompilerOptions};
-use leo_errors::{CliError, UtilError};
-use leo_package::{ABI_FILENAME, BUILD_DIRECTORY, INTERFACES_DIRECTORY, Manifest, Package};
+use leo_package::{ABI_FILENAME, Package};
 use leo_span::Symbol;
 
 use snarkvm::prelude::{CanaryV0, MainnetV0, Process as SvmProcess, Program as SvmProgram, TestnetV0};
@@ -27,9 +26,21 @@ use snarkvm::prelude::{CanaryV0, MainnetV0, Process as SvmProcess, Program as Sv
 use indexmap::IndexMap;
 use itertools::Itertools;
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     rc::Rc,
 };
+
+/// Network-typed `Process` used during the disassemble loop. The variants let
+/// a single loop body reuse a process across iterations without triplicating
+/// the body for each network. Held for the duration of the build's stub
+/// resolution, then dropped (a separate `Process` is loaded later for the
+/// post-build bulk validation in `validate_compiled_programs_inner`).
+enum DisassembleProcess {
+    Mainnet(SvmProcess<MainnetV0>),
+    Testnet(SvmProcess<TestnetV0>),
+    Canary(SvmProcess<CanaryV0>),
+}
 
 /// A program queued for bytecode validation after the build.
 struct ProgramForValidation {
@@ -77,8 +88,21 @@ impl Command for LeoBuild {
     }
 
     fn apply(self, context: Context, _: Self::Input) -> Result<Self::Output> {
-        // Build the program.
-        handle_build(&self, context)
+        match context.resolve_targets()? {
+            Some(targets) => {
+                let mut last_package = None;
+                for target in &targets {
+                    let member_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    if targets.len() > 1 {
+                        println!("\n--- workspace member '{member_name}' ---");
+                    }
+                    let member_ctx = context.with_path(target.clone());
+                    last_package = Some(handle_build(&self, member_ctx)?);
+                }
+                last_package.ok_or_else(|| crate::errors::custom("No workspace members found.").into())
+            }
+            None => handle_build(&self, context),
+        }
     }
 }
 
@@ -138,23 +162,18 @@ fn handle_build(command: &LeoBuild, context: Context) -> Result<<LeoBuild as Com
         );
     }
 
-    let outputs_directory = package.outputs_directory();
     let build_directory = package.build_directory();
-    let imports_directory = package.imports_directory();
     let source_directory = package.source_directory();
     let main_source_path = source_directory.join("main.leo");
 
-    // Use the flag already computed by Package during dependency resolution rather than
-    // re-checking the filesystem. The main program is always last in topological order.
-    let primary_name = package.compilation_units.last().map(|p| p.name);
-    let is_library = package.compilation_units.last().map(|p| p.kind.is_library()).unwrap_or(false);
-    if !is_library {
-        for dir in [&outputs_directory, &build_directory, &imports_directory] {
-            std::fs::create_dir_all(dir).map_err(|err| {
-                UtilError::util_file_io_error(format_args!("Couldn't create directory {}", dir.display()), err)
-            })?;
-        }
-    }
+    // Resolve via the manifest so this isn't a test unit under `--build-tests`.
+    let primary_name = package.primary_unit().map(|p| p.name);
+    std::fs::create_dir_all(&build_directory).map_err(|err| {
+        crate::errors::util_file_io_error(format_args!("Couldn't create directory {}", build_directory.display()), err)
+    })?;
+    // Clear artifacts from the pre-flat-layout build directory so they don't
+    // linger beside the new per-program directories after an upgrade.
+    remove_legacy_build_artifacts(&build_directory);
 
     // Initialize error handler.
     let handler = Handler::default();
@@ -166,25 +185,62 @@ fn handle_build(command: &LeoBuild, context: Context) -> Result<<LeoBuild as Com
     // (imports must be loaded before the programs that depend on them).
     let mut compiled_programs: IndexMap<String, ProgramForValidation> = IndexMap::new();
 
+    // Tracks compilation units whose build artifacts have already been written this
+    // build, so each unit is written exactly once - by its first (most authoritative)
+    // compilation. The package's own program is compiled before its tests, so its
+    // primary build is kept rather than a test's re-derived import copy.
+    let mut written: HashSet<String> = HashSet::new();
+
+    // Hoist a typed `Process` for the active network so bytecode dependencies are
+    // validated through `Process::add_program` *before* `disassemble` runs on them
+    // (issue #29399 — `from_function_core` panics on shapes the grammar accepts).
+    // `add_program` is contextual, so the same process must be reused across the
+    // loop in topological order; the enum lets the network-typed process live
+    // across iterations without triplicating the loop body.
+    let mut disassemble_process = match network {
+        NetworkName::MainnetV0 => DisassembleProcess::Mainnet(SvmProcess::<MainnetV0>::load().map_err(|e| {
+            crate::errors::custom(format!("Failed to initialize snarkVM process for disassembler validation: {e}"))
+        })?),
+        NetworkName::TestnetV0 => DisassembleProcess::Testnet(SvmProcess::<TestnetV0>::load().map_err(|e| {
+            crate::errors::custom(format!("Failed to initialize snarkVM process for disassembler validation: {e}"))
+        })?),
+        NetworkName::CanaryV0 => DisassembleProcess::Canary(SvmProcess::<CanaryV0>::load().map_err(|e| {
+            crate::errors::custom(format!("Failed to initialize snarkVM process for disassembler validation: {e}"))
+        })?),
+    };
+
     for unit in &package.compilation_units {
+        let unit_name = unit.name.to_string();
+        // Normalize key so `"foo.aleo"` and `"foo"` don't collide on the same dir.
+        let unit_key = leo_package::bare_unit_name(&unit_name).to_string();
         match &unit.data {
             leo_package::ProgramData::Bytecode(bytecode) => {
                 // This was a network dependency or local .aleo dependency, and we have its bytecode.
-                let build_path = imports_directory.join(format!("{}", unit.name));
+                let build_path = package.unit_bytecode_path(&unit_name);
 
-                // Write the .aleo file.
-                std::fs::write(&build_path, bytecode).map_err(CliError::failed_to_load_instructions)?;
+                // Write the .aleo file into the program's own build directory.
+                if written.insert(unit_key.clone()) {
+                    ensure_parent_dir(&build_path)?;
+                    std::fs::write(&build_path, bytecode).map_err(crate::errors::failed_to_load_instructions)?;
+                }
 
-                // Track the stub.
-                let stub = match network {
-                    NetworkName::MainnetV0 => leo_disassembler::disassemble_from_str::<MainnetV0>(unit.name, bytecode),
-                    NetworkName::TestnetV0 => leo_disassembler::disassemble_from_str::<TestnetV0>(unit.name, bytecode),
-                    NetworkName::CanaryV0 => leo_disassembler::disassemble_from_str::<CanaryV0>(unit.name, bytecode),
+                // Track the stub. Validates via `Process::add_program` and disassembles in
+                // one step; the hoisted process accumulates dependencies across iterations.
+                let stub = match &mut disassemble_process {
+                    DisassembleProcess::Mainnet(p) => {
+                        leo_disassembler::disassemble_from_str::<MainnetV0>(unit.name, bytecode, p)
+                    }
+                    DisassembleProcess::Testnet(p) => {
+                        leo_disassembler::disassemble_from_str::<TestnetV0>(unit.name, bytecode, p)
+                    }
+                    DisassembleProcess::Canary(p) => {
+                        leo_disassembler::disassemble_from_str::<CanaryV0>(unit.name, bytecode, p)
+                    }
                 }?;
 
                 stubs.insert(unit.name, stub.into());
 
-                compiled_programs.entry(unit.name.to_string()).or_insert(ProgramForValidation {
+                compiled_programs.entry(unit_key.clone()).or_insert(ProgramForValidation {
                     bytecode: bytecode.clone(),
                     path: build_path,
                     is_leo_compiled: false,
@@ -197,7 +253,7 @@ fn handle_build(command: &LeoBuild, context: Context) -> Result<<LeoBuild as Com
                     source
                         .parent()
                         .ok_or_else(|| {
-                            UtilError::failed_to_open_file(format_args!(
+                            crate::errors::failed_to_open_file(format_args!(
                                 "Failed to find directory for test {}",
                                 source.display()
                             ))
@@ -207,14 +263,17 @@ fn handle_build(command: &LeoBuild, context: Context) -> Result<<LeoBuild as Com
                     directory.join("src")
                 };
 
-                if source == &main_source_path || unit.kind.is_test() {
-                    // Compile the program (main or test).
+                let is_main = source == &main_source_path;
+                if is_main || unit.kind.is_test() {
+                    // Compile the program (main or test). AST snapshots, if enabled, land
+                    // under this unit's own `build/<name>/snapshots/` directory.
+                    let snapshots_directory = package.unit_snapshots_directory(&unit_name);
                     let compiled = compile_leo_source_directory(
                         source, // entry file
                         &source_dir,
                         unit.name,
                         unit.kind.is_test(),
-                        &outputs_directory,
+                        &snapshots_directory,
                         &handler,
                         &node_builder,
                         command.options.clone(),
@@ -222,54 +281,53 @@ fn handle_build(command: &LeoBuild, context: Context) -> Result<<LeoBuild as Com
                         network,
                     )?;
 
-                    // Where to write the primary bytecode?
-                    let primary_path = if source == &main_source_path {
-                        build_directory.join("main.aleo")
-                    } else {
-                        imports_directory.join(format!("{}", unit.name))
-                    };
+                    // Write this unit's compiled bytecode. ABI and interface ABIs are
+                    // emitted only for the main program; tests deliberately skip them.
+                    let primary_path = package.unit_bytecode_path(&unit_name);
+                    if written.insert(unit_key.clone()) {
+                        ensure_parent_dir(&primary_path)?;
+                        std::fs::write(&primary_path, &compiled.primary.bytecode)
+                            .map_err(crate::errors::failed_to_load_instructions)?;
+                        if is_main {
+                            let abi_path = package.unit_abi_path(&unit_name);
+                            let abi_json = serde_json::to_string_pretty(&compiled.primary.abi)
+                                .map_err(|e| crate::errors::failed_to_serialize_abi(e.to_string()))?;
+                            std::fs::write(&abi_path, abi_json).map_err(crate::errors::failed_to_write_abi)?;
+                            tracing::info!("✅ Generated ABI for program '{unit_name}'.");
+                            let interfaces_directory = package.unit_interfaces_directory(&unit_name);
+                            write_interface_abis(&interfaces_directory, &compiled.interfaces)?;
+                        }
+                    }
 
-                    // Write the primary program bytecode.
-                    std::fs::write(&primary_path, &compiled.primary.bytecode)
-                        .map_err(CliError::failed_to_load_instructions)?;
-
-                    // Write imports (bytecode and ABI) and queue for validation.
+                    // Write each import's bytecode and ABI into its own build directory.
                     for import in &compiled.imports {
-                        let import_path = imports_directory.join(&import.name);
-                        std::fs::write(&import_path, &import.bytecode)
-                            .map_err(CliError::failed_to_load_instructions)?;
+                        let import_path = package.unit_bytecode_path(&import.name);
+                        let import_key = leo_package::bare_unit_name(&import.name).to_string();
+                        if written.insert(import_key.clone()) {
+                            ensure_parent_dir(&import_path)?;
+                            std::fs::write(&import_path, &import.bytecode)
+                                .map_err(crate::errors::failed_to_load_instructions)?;
 
-                        let import_abi_path = imports_directory.join(format!("{}.abi.json", import.name));
-                        let import_abi_json = serde_json::to_string_pretty(&import.abi)
-                            .map_err(|e| CliError::failed_to_serialize_abi(e.to_string()))?;
-                        std::fs::write(&import_abi_path, import_abi_json).map_err(CliError::failed_to_write_abi)?;
+                            let import_abi_path = package.unit_abi_path(&import.name);
+                            let import_abi_json = serde_json::to_string_pretty(&import.abi)
+                                .map_err(|e| crate::errors::failed_to_serialize_abi(e.to_string()))?;
+                            std::fs::write(&import_abi_path, import_abi_json)
+                                .map_err(crate::errors::failed_to_write_abi)?;
+                        }
 
                         // Queue import for validation.
-                        compiled_programs.entry(import.name.clone()).or_insert(ProgramForValidation {
+                        compiled_programs.entry(import_key).or_insert(ProgramForValidation {
                             bytecode: import.bytecode.clone(),
                             path: import_path,
                             is_leo_compiled: true,
                         });
                     }
                     // Queue the primary program.
-                    compiled_programs.entry(unit.name.to_string()).or_insert(ProgramForValidation {
+                    compiled_programs.entry(unit_key.clone()).or_insert(ProgramForValidation {
                         bytecode: compiled.primary.bytecode.clone(),
                         path: primary_path,
                         is_leo_compiled: true,
                     });
-
-                    // Write the ABI file for the main program.
-                    if source == &main_source_path {
-                        let abi_path = build_directory.join(ABI_FILENAME);
-                        let abi_json = serde_json::to_string_pretty(&compiled.primary.abi)
-                            .map_err(|e| CliError::failed_to_serialize_abi(e.to_string()))?;
-                        std::fs::write(&abi_path, abi_json).map_err(CliError::failed_to_write_abi)?;
-                        tracing::info!("✅ Generated ABI at '{BUILD_DIRECTORY}/{ABI_FILENAME}'.");
-
-                        // Write interface ABIs.
-                        let interfaces_directory = package_path.join(INTERFACES_DIRECTORY);
-                        write_interface_abis(&interfaces_directory, &compiled.interfaces)?;
-                    }
                 }
 
                 if unit.kind.is_library() {
@@ -279,10 +337,12 @@ fn handle_build(command: &LeoBuild, context: Context) -> Result<<LeoBuild as Com
                     // dependencies are parsed only; their semantics are validated when their own
                     // `leo build` is run.
                     let library = if primary_name == Some(unit.name) {
+                        let snapshots_directory = package.unit_snapshots_directory(&unit_name);
                         let (lib, interfaces) = build_leo_source_directory_library(
                             source,
                             &source_dir,
                             unit.name,
+                            &snapshots_directory,
                             &handler,
                             &node_builder,
                             command.options.clone(),
@@ -291,7 +351,7 @@ fn handle_build(command: &LeoBuild, context: Context) -> Result<<LeoBuild as Com
                         )?;
 
                         // Write interface ABIs for the primary library.
-                        let interfaces_directory = package_path.join(INTERFACES_DIRECTORY);
+                        let interfaces_directory = package.unit_interfaces_directory(&unit_name);
                         write_interface_abis(&interfaces_directory, &interfaces)?;
 
                         lib
@@ -335,23 +395,51 @@ fn handle_build(command: &LeoBuild, context: Context) -> Result<<LeoBuild as Com
         }
     }
 
+    // Ensure every program unit has on-disk bytecode for downstream commands; the
+    // parse-only path above skips manifest deps the main source doesn't `import`.
+    for unit in &package.compilation_units {
+        if !unit.kind.is_program() || unit.kind.is_test() {
+            continue;
+        }
+        let leo_package::ProgramData::SourcePath { directory, source } = &unit.data else { continue };
+        let unit_name = unit.name.to_string();
+        let unit_key = leo_package::bare_unit_name(&unit_name).to_string();
+        if !written.insert(unit_key.clone()) {
+            continue;
+        }
+        let source_dir = directory.join("src");
+        let snapshots_directory = package.unit_snapshots_directory(&unit_name);
+        let compiled = compile_leo_source_directory(
+            source,
+            &source_dir,
+            unit.name,
+            false,
+            &snapshots_directory,
+            &handler,
+            &node_builder,
+            command.options.clone(),
+            stubs.clone(),
+            network,
+        )?;
+        let primary_path = package.unit_bytecode_path(&unit_name);
+        ensure_parent_dir(&primary_path)?;
+        std::fs::write(&primary_path, &compiled.primary.bytecode)
+            .map_err(crate::errors::failed_to_load_instructions)?;
+        let abi_path = package.unit_abi_path(&unit_name);
+        let abi_json = serde_json::to_string_pretty(&compiled.primary.abi)
+            .map_err(|e| crate::errors::failed_to_serialize_abi(e.to_string()))?;
+        std::fs::write(&abi_path, abi_json).map_err(crate::errors::failed_to_write_abi)?;
+        let interfaces_directory = package.unit_interfaces_directory(&unit_name);
+        write_interface_abis(&interfaces_directory, &compiled.interfaces)?;
+        compiled_programs.entry(unit_key).or_insert(ProgramForValidation {
+            bytecode: compiled.primary.bytecode.clone(),
+            path: primary_path,
+            is_leo_compiled: true,
+        });
+    }
+
     // Validate generated bytecode through snarkVM's type checker.
     validate_compiled_programs(&compiled_programs, network)?;
-
-    if !is_library {
-        // SnarkVM expects to find a `program.json` file in the build directory, so make a bogus one.
-        let build_manifest_path = build_directory.join(leo_package::MANIFEST_FILENAME);
-        let fake_manifest = Manifest {
-            program: package.manifest.program.clone(),
-            version: "0.1.0".to_string(),
-            description: String::new(),
-            license: String::new(),
-            leo: env!("CARGO_PKG_VERSION").to_string(),
-            dependencies: None,
-            dev_dependencies: None,
-        };
-        fake_manifest.write_to_file(build_manifest_path)?;
-    }
 
     Ok(package)
 }
@@ -394,11 +482,7 @@ fn compile_leo_source_directory(
     let program_size = primary_bytecode.len();
 
     if program_size > MAX_PROGRAM_SIZE {
-        return Err(leo_errors::LeoError::UtilError(UtilError::program_size_limit_exceeded(
-            program_name,
-            program_size,
-            MAX_PROGRAM_SIZE,
-        )));
+        return Err(crate::errors::program_size_limit_exceeded(program_name, program_size, MAX_PROGRAM_SIZE).into());
     }
 
     // Get the AVM bytecode.
@@ -481,19 +565,23 @@ fn validate_compiled_programs(programs: &IndexMap<String, ProgramForValidation>,
 fn validate_compiled_programs_inner<N: snarkvm::prelude::Network>(
     programs: &IndexMap<String, ProgramForValidation>,
 ) -> Result<()> {
-    let mut process = SvmProcess::<N>::load()
-        .map_err(|e| CliError::custom(format!("Failed to initialize snarkVM process for bytecode validation: {e}")))?;
+    let process = SvmProcess::<N>::load().map_err(|e| {
+        crate::errors::custom(format!("Failed to initialize snarkVM process for bytecode validation: {e}"))
+    })?;
 
     for (name, ProgramForValidation { bytecode, path, is_leo_compiled }) in programs {
-        let program = SvmProgram::<N>::from_str(bytecode).map_err(|e| CliError::failed_to_parse_aleo_file(name, e))?;
+        let program =
+            SvmProgram::<N>::from_str(bytecode).map_err(|e| crate::errors::failed_to_parse_aleo_file(name, e))?;
 
         let checksum = program.to_checksum().iter().join(", ");
 
-        process.add_program_with_edition(&program, LOCAL_PROGRAM_DEFAULT_EDITION).map_err(|e| {
+        process.lock().add_program_with_edition(&program, LOCAL_PROGRAM_DEFAULT_EDITION).map_err(|e| {
             if *is_leo_compiled {
-                CliError::generated_invalid_bytecode(name, path.display(), &checksum, e)
+                crate::errors::generated_invalid_bytecode(name, path.display(), &checksum, e)
             } else {
-                CliError::custom(format!("snarkVM rejected external program '{name}' during build validation: {e}"))
+                crate::errors::custom(format!(
+                    "snarkVM rejected external program '{name}' during build validation: {e}"
+                ))
             }
         })?;
     }
@@ -534,6 +622,7 @@ fn build_leo_source_directory_library(
     entry_file_path: &Path,
     source_directory: &Path,
     library_name: Symbol,
+    snapshots_directory: &Path,
     handler: &Handler,
     node_builder: &Rc<NodeBuilder>,
     options: BuildOptions,
@@ -549,7 +638,7 @@ fn build_leo_source_directory_library(
         false,
         handler.clone(),
         Rc::clone(node_builder),
-        std::path::PathBuf::default(),
+        snapshots_directory.to_path_buf(),
         Some(options.into()),
         stubs,
         network,
@@ -567,7 +656,7 @@ fn build_leo_source_directory_library(
 fn write_interface_abis(interfaces_dir: &Path, interfaces: &[leo_abi::interfaces::CompiledInterface]) -> Result<()> {
     // Remove stale files from a previous build (renamed/deleted interfaces).
     if interfaces_dir.exists() {
-        std::fs::remove_dir_all(interfaces_dir).map_err(CliError::failed_to_write_abi)?;
+        std::fs::remove_dir_all(interfaces_dir).map_err(crate::errors::failed_to_write_abi)?;
     }
     if interfaces.is_empty() {
         return Ok(());
@@ -581,12 +670,42 @@ fn write_interface_abis(interfaces_dir: &Path, interfaces: &[leo_abi::interfaces
         for seg in &ci.abi.path[..ci.abi.path.len().saturating_sub(1)] {
             file_path.push(seg);
         }
-        std::fs::create_dir_all(&file_path).map_err(CliError::failed_to_write_abi)?;
+        std::fs::create_dir_all(&file_path).map_err(crate::errors::failed_to_write_abi)?;
         file_path.push(format!("{}.json", ci.abi.name));
         let json =
-            serde_json::to_string_pretty(&ci.abi).map_err(|e| CliError::failed_to_serialize_abi(e.to_string()))?;
-        std::fs::write(&file_path, json).map_err(CliError::failed_to_write_abi)?;
+            serde_json::to_string_pretty(&ci.abi).map_err(|e| crate::errors::failed_to_serialize_abi(e.to_string()))?;
+        std::fs::write(&file_path, json).map_err(crate::errors::failed_to_write_abi)?;
     }
-    tracing::info!("✅ Generated {} interface ABI(s) at '{INTERFACES_DIRECTORY}/'.", interfaces.len());
+    tracing::info!("✅ Generated {} interface ABI(s).", interfaces.len());
     Ok(())
+}
+
+/// Ensure the parent directory of `path` exists, creating it if necessary.
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            crate::errors::util_file_io_error(format_args!("Couldn't create directory {}", parent.display()), err)
+        })?;
+    }
+    Ok(())
+}
+
+/// Remove artifacts left by the pre-flat-layout build directory (`build/main.aleo`,
+/// `build/imports/`, etc.) so they don't linger beside the new per-program
+/// directories after an upgrade. Best-effort: missing entries are ignored.
+///
+/// Gated on a top-level legacy artifact so we don't wipe a perfectly valid new-layout
+/// per-unit directory for a user program literally named `imports` or `interfaces`.
+fn remove_legacy_build_artifacts(build_directory: &Path) {
+    let is_legacy =
+        build_directory.join("main.aleo").exists() || build_directory.join(leo_package::MANIFEST_FILENAME).exists();
+    if !is_legacy {
+        return;
+    }
+    for file in ["main.aleo", ABI_FILENAME, leo_package::MANIFEST_FILENAME] {
+        let _ = std::fs::remove_file(build_directory.join(file));
+    }
+    for dir in ["imports", "interfaces"] {
+        let _ = std::fs::remove_dir_all(build_directory.join(dir));
+    }
 }

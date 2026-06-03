@@ -4,7 +4,7 @@ title: Functions
 sidebar_label: Functions
 ---
 
-[general tags]: # "fn, final, entry_function, helper_function, final_fn"
+[general tags]: # "fn, final, view, entry_function, helper_function, final_fn, view_fn"
 
 ## Entry Functions
 
@@ -48,6 +48,34 @@ When finalization logic is shared across multiple entry functions, it can be ext
 
 The body of `decrement_balance` is inlined into each caller's `final { }` block at compile time — no shared function exists in the compiled output.
 
+## View Functions
+
+A `view fn` is a read-only entry point. It is declared inside a `program {}` block with the `view` modifier and exposes a query that can be evaluated by a node without producing a transaction.
+
+```leo file=../../code_snippets/functions/view_basic/src/main.leo#file showLineNumbers
+```
+
+A `view fn` body sees the same on-chain context as a `final {}` block — it can read mappings, storage, vectors, `block.height`, and `network.id`. Beyond the `final {}` rules above, a view adds these restrictions:
+
+- **Read-only.** All state writes are rejected — both singleton storage assignment (`counter = 5u64;`, `counter = none;`) and the mutating intrinsics `Mapping::set`, `Mapping::remove`, `Vector::set`, `Vector::push`, `Vector::pop`, `Vector::swap_remove`, `Vector::clear`.
+- **Leaf in the emitted bytecode.** A view may call a helper `fn` (its body is fully inlined into the view), but it cannot `call` another `view fn`, a `final fn`, or an entry point. This keeps the emitted Aleo `view` block free of `call` instructions, which snarkVM requires. Dynamic calls (the `dyn ...` form) are also rejected.
+- No `block.timestamp`, `Snark::verify`, `Snark::verify_batch`, or `program_owner` — these are available in `final {}` but not when a node evaluates a view off-consensus.
+- Returns plaintext only (no records); cannot be combined with `final`.
+
+### Calling Views from On-chain Code
+
+`view fn`s are only callable from a finalize context — a `final {}` block, a `final fn` helper, or a hoisted finalize body. A plain entry-function body cannot call a view directly.
+
+```leo file=../../code_snippets/functions/view_in_finalize/src/main.leo#file showLineNumbers
+```
+
+Unlike a helper `fn` (which is inlined at its call site), a `view fn` remains a separate callable entity, and each invocation from the `final {}` block re-runs the view's body.
+
+The same rule applies across programs — a `final {}` block can call a `view fn` exposed by an imported program:
+
+```leo file=../../code_snippets/functions/view_cross_program_caller/src/main.leo#file showLineNumbers
+```
+
 ## Helper Function
 
 A helper function is declared as `fn {name}({arguments}) {}` **outside** the `program {}` block.
@@ -72,16 +100,38 @@ Const generic parameters are only valid on inlinable helper `fn` functions. They
 
 ### The `@no_inline` Annotation
 
-By default the compiler inlines helper functions that are called only once, which reduces call overhead. To prevent this, annotate the function with `@no_inline`:
+By default the compiler inlines a helper `fn` whenever inlining is safe and beneficial — most commonly when the function is called only once, takes no arguments, or all of its arguments have empty types. Inlining reduces call overhead and shrinks the compiled program.
+
+To opt out of this default and force a separate AVM function for a helper, annotate it with `@no_inline`:
 
 ```leo file=../../code_snippets/functions/no_inline/src/main.leo#snippet
 ```
 
 Use `@no_inline` when the function is intentionally shared across multiple call sites but the compiler would otherwise duplicate it, or when you want to preserve the function boundary for readability in the compiled output.
 
+#### When `@no_inline` is ignored
+
+Some helpers cannot exist as standalone AVM functions and **must** be inlined regardless of the annotation. In these cases the compiler ignores `@no_inline` and emits a warning at the annotation site:
+
+- helper functions defined in a submodule (`path::nested::fn`) — Aleo identifiers are flat, so there is no bytecode form for a nested name,
+- helper functions defined in a [library](../06_libraries.md) — libraries have no on-chain footprint,
+- a `final fn`,
+- a helper reached from an on-chain context (a `constructor` or finalize block),
+- a helper with more than 16 arguments,
+- a helper whose argument or return type names an `Optional` type,
+- helpers transitively reachable from another helper that itself must be inlined.
+
+The annotation has no effect on entry `fn` declarations either — the entry-point boundary is part of the program's public interface and is never inlined away.
+
+### The `@inline` Annotation
+
+The compiler accepts `@inline` as a recognized annotation name, but **no compiler pass acts on it** — it is a silent no-op carried over from earlier Leo versions, where `inline` was a function-modifier keyword rather than an annotation (see [Migrating from Leo 3.5 to 4.0](../../guides/13_migration_3_5_to_4_0.md#inline-becomes-fn)). The default inlining behaviour described above is the same whether or not `@inline` is present, so prefer to leave it out of new code.
+
 ## Function Call Rules
 
-- An entry `fn` can call: helper `fn`, `final fn`, and external entry `fn`s.
+- An entry `fn` can call: helper `fn`s, `final fn`s, and external entry `fn`s. Local entry `fn`s and `view fn`s (outside a `final {}` block) are rejected.
 - A helper `fn` can only call: other helper `fn`s.
-- A `final fn` can only call: other `final fn`s.
+- A `final fn` can call: helper `fn`s, other `final fn`s, and `view fn`s.
+- A `final {}` block can call: helper `fn`s, `final fn`s, and `view fn`s (same-program or cross-program).
+- A `view fn` can only call helper `fn`s (which get inlined). Other `view fn`s, `final fn`s, and entry points are rejected.
 - Recursive calls (direct or indirect) are not allowed.

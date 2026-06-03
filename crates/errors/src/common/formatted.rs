@@ -22,14 +22,11 @@ use leo_span::{
 };
 
 pub use ariadne::Color;
-use ariadne::Report;
-use std::{
-    fmt,
-    hash::{Hash, Hasher},
-};
+use ariadne::{IndexType, Report};
+use std::fmt;
 
 /// Represents error labels.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Label {
     msg: String,
     span: Span,
@@ -37,17 +34,39 @@ pub struct Label {
 }
 
 impl Label {
-    pub fn new(msg: impl fmt::Display, span: Span) -> Self {
-        Self { msg: msg.to_string(), span, color: Color::default() }
+    pub fn new(span: Span) -> Self {
+        Self { msg: String::new(), span, color: Color::default() }
+    }
+
+    pub fn with_message(mut self, msg: impl fmt::Display) -> Self {
+        self.msg = msg.to_string();
+        self
     }
 
     pub fn with_color(mut self, color: Color) -> Self {
         self.color = color;
         self
     }
+
+    /// Borrow the secondary label's message without copying.
+    ///
+    /// Surfaced for `Formatted::diagnostic_view`, which lowers labels into
+    /// LSP-facing related-information entries without re-parsing rendered text.
+    pub fn message(&self) -> &str {
+        &self.msg
+    }
+
+    /// Return the secondary label's source span.
+    ///
+    /// Used by structured diagnostic consumers (notably `leo-lsp`) to convert
+    /// labels into UTF-16 ranges while the session source map is still alive.
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }
 
 /// Helper span for Ariadne that includes the source file start index.
+#[derive(Clone)]
 struct AriadneSpan {
     file_start_index: u32,
     span: Span,
@@ -80,12 +99,17 @@ impl ariadne::Span for AriadneSpan {
 ///
 /// Stores all error components as plain owned fields.
 /// The ariadne `Report` is built on the fly in `Display::fmt`.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Formatted {
+    inner: Box<FormattedInner>,
+}
+
+#[derive(Debug)]
+struct FormattedInner {
     message: String,
     help: Option<String>,
+    note: Option<String>,
     code: i32,
-    code_identifier: i8,
     type_: String,
     error: bool,
     span: Span,
@@ -94,12 +118,10 @@ pub struct Formatted {
 
 impl Formatted {
     /// Creates a formatted error from a span and labels.
-    #[allow(clippy::too_many_arguments)]
     pub fn new_from_span<S>(
         message: S,
         help: Option<String>,
         code: i32,
-        code_identifier: i8,
         type_: String,
         error: bool,
         span: Span,
@@ -108,22 +130,140 @@ impl Formatted {
     where
         S: ToString,
     {
-        Self { message: message.to_string(), help, code, code_identifier, type_, error, span, labels }
+        Self {
+            inner: Box::new(FormattedInner {
+                message: message.to_string(),
+                help,
+                note: None,
+                code,
+                type_,
+                error,
+                span,
+                labels,
+            }),
+        }
+    }
+
+    /// Create a new error.
+    pub fn error(code_prefix: &str, code: i32, message: impl ToString, span: Span) -> Self {
+        Self::new_from_span(message, None, code, code_prefix.to_string(), true, span, vec![])
+    }
+
+    /// Create a new warning.
+    pub fn warning(code_prefix: &str, code: i32, message: impl ToString, span: Span) -> Self {
+        Self::new_from_span(message, None, code, code_prefix.to_string(), false, span, vec![])
+    }
+
+    pub fn with_help(mut self, help: impl fmt::Display) -> Self {
+        self.inner.help = Some(help.to_string());
+        self
+    }
+
+    pub fn with_note(mut self, note: impl fmt::Display) -> Self {
+        self.inner.note = Some(note.to_string());
+        self
+    }
+
+    pub fn with_label(mut self, label: Label) -> Self {
+        self.inner.labels.push(label);
+        self
+    }
+
+    pub fn with_labels(mut self, labels: impl IntoIterator<Item = Label>) -> Self {
+        self.inner.labels.extend(labels);
+        self
     }
 
     /// Gets the exit code.
     pub fn exit_code(&self) -> i32 {
-        compute_exit_code(self.code_identifier, self.code)
+        compute_exit_code(37, self.inner.code)
     }
 
     /// Gets a unique error identifier.
     pub fn error_code(&self) -> String {
-        format_error_code(&self.type_, self.code_identifier, self.code)
+        format_error_code(&self.inner.type_, 37, self.inner.code)
     }
 
     /// Gets a unique warning identifier.
     pub fn warning_code(&self) -> String {
-        format_warning_code(&self.type_, self.code_identifier, self.code)
+        format_warning_code(&self.inner.type_, 37, self.inner.code)
+    }
+
+    /// Return the diagnostic's primary message without ariadne rendering.
+    ///
+    /// Used by tooling consumers (notably `leo-lsp`) that need the bare message
+    /// text rather than the formatted report. The returned slice borrows from
+    /// the same allocation as the rest of the diagnostic and therefore stays
+    /// valid for the lifetime of the `Formatted` value.
+    pub fn message(&self) -> &str {
+        &self.inner.message
+    }
+
+    /// Return the diagnostic's optional help text, if any.
+    ///
+    /// `leo-lsp` appends this to the LSP diagnostic message so editor clients
+    /// see the same hint that the CLI report would render.
+    pub fn help(&self) -> Option<&str> {
+        self.inner.help.as_deref()
+    }
+
+    /// Return the diagnostic's optional follow-up note text, if any.
+    ///
+    /// `leo-lsp` appends this to the LSP diagnostic message for parity with
+    /// CLI-rendered reports.
+    pub fn note(&self) -> Option<&str> {
+        self.inner.note.as_deref()
+    }
+
+    /// Return whether this diagnostic was raised as an error rather than a
+    /// warning.
+    ///
+    /// LSP severity mapping depends on this flag instead of inspecting the
+    /// rendered `Error`/`Warning` prefix in the formatted message.
+    pub fn is_error(&self) -> bool {
+        self.inner.error
+    }
+
+    /// Return the diagnostic's primary span.
+    ///
+    /// Callers must resolve this span against `leo_span` session globals to
+    /// recover the originating source file before the surrounding session is
+    /// torn down.
+    pub fn span(&self) -> Span {
+        self.inner.span
+    }
+
+    /// Iterate the diagnostic's secondary labels in declaration order.
+    ///
+    /// Labels carry their own span and human-readable message, which `leo-lsp`
+    /// surfaces as `Diagnostic.relatedInformation` when the client supports it.
+    pub fn labels(&self) -> impl Iterator<Item = &Label> {
+        self.inner.labels.iter()
+    }
+
+    /// Borrow this diagnostic as a plain structured view.
+    ///
+    /// The returned [`DiagnosticView`] exposes the same fields that are used
+    /// when rendering the ariadne report, without round-tripping through a
+    /// formatted string. Consumers like `leo-lsp` use the view to build LSP
+    /// `Diagnostic` payloads without parsing rendered output.
+    pub fn diagnostic_view(&self) -> DiagnosticView<'_> {
+        let code = if self.inner.error { self.error_code() } else { self.warning_code() };
+        let labels = self
+            .inner
+            .labels
+            .iter()
+            .map(|label| DiagnosticLabelView { message: label.message().to_owned(), span: label.span() })
+            .collect();
+        DiagnosticView {
+            message: &self.inner.message,
+            help: self.inner.help.as_deref(),
+            note: self.inner.note.as_deref(),
+            code,
+            is_error: self.inner.error,
+            span: Some(self.inner.span),
+            labels,
+        }
     }
 
     /// Resolve a Leo `Span` to an `AriadneSpan` using the source map.
@@ -136,16 +276,27 @@ impl Formatted {
     fn build_report(&self) -> Report<'_, AriadneSpan> {
         use leo_span::with_session_globals;
 
-        let primary_color = if self.error { Color::Red } else { Color::Yellow };
+        let primary_color = if self.inner.error { Color::Red } else { Color::Yellow };
 
         with_session_globals(|s| {
-            let primary_span = Self::resolve_span(self.span, &s.source_map);
+            let primary_span = Self::resolve_span(self.inner.span, &s.source_map);
 
-            // Always include a label for the primary span so ariadne renders the source snippet.
-            let primary_label = std::iter::once(
-                ariadne::Label::new(Self::resolve_span(self.span, &s.source_map)).with_color(primary_color),
-            );
+            // Ariadne only renders source lines for a multi-line label when its message is `Some(_)`
+            // (see `multi_labels_with_message` in ariadne's write.rs). For single-line spans we skip
+            // `with_message` to avoid the dangling `─┬─` / `╰──` decorations under the caret.
+            let primary_is_multiline = s.source_map.find_source_file(self.inner.span.lo).is_some_and(|f| {
+                let lo = (self.inner.span.lo - f.absolute_start) as usize;
+                let hi = (self.inner.span.hi - f.absolute_start) as usize;
+                f.src.as_bytes().get(lo..hi).is_some_and(|b| b.contains(&b'\n'))
+            });
+            let mut primary = ariadne::Label::new(primary_span.clone()).with_color(primary_color);
+            if primary_is_multiline {
+                primary = primary.with_message("");
+            }
+            let primary_label = std::iter::once(primary);
+
             let extra_labels: Vec<_> = self
+                .inner
                 .labels
                 .iter()
                 .map(|l| {
@@ -156,16 +307,20 @@ impl Formatted {
                 .collect();
 
             let mut report = Report::build(
-                if self.error { ariadne::ReportKind::Error } else { ariadne::ReportKind::Warning },
+                if self.inner.error { ariadne::ReportKind::Error } else { ariadne::ReportKind::Warning },
                 primary_span,
             )
-            .with_config(ariadne::Config::default().with_color(is_color()))
-            .with_message(&self.message)
-            .with_code(if self.error { self.error_code() } else { self.warning_code() })
+            .with_config(ariadne::Config::default().with_color(is_color()).with_index_type(IndexType::Byte))
+            .with_message(&self.inner.message)
+            .with_code(if self.inner.error { self.error_code() } else { self.warning_code() })
             .with_labels(primary_label.chain(extra_labels));
 
-            if let Some(help) = &self.help {
+            if let Some(help) = &self.inner.help {
                 report = report.with_help(help);
+            }
+
+            if let Some(note) = &self.inner.note {
+                report = report.with_note(note);
             }
 
             report.finish()
@@ -184,10 +339,14 @@ impl fmt::Display for Formatted {
             write!(f, "{output}")
         } else {
             // Fallback when session globals are unavailable (e.g. tests).
-            let (kind, code) = if self.error { ("Error", self.error_code()) } else { ("Warning", self.warning_code()) };
-            write!(f, "{kind} [{code}]: {}", self.message)?;
-            if let Some(help) = &self.help {
+            let (kind, code) =
+                if self.inner.error { ("Error", self.error_code()) } else { ("Warning", self.warning_code()) };
+            write!(f, "{kind} [{code}]: {}", self.inner.message)?;
+            if let Some(help) = &self.inner.help {
                 write!(f, "\n    = help: {help}")?;
+            }
+            if let Some(note) = &self.inner.note {
+                write!(f, "\n    = note: {note}")?;
             }
             Ok(())
         }
@@ -196,22 +355,94 @@ impl fmt::Display for Formatted {
 
 impl std::error::Error for Formatted {
     fn description(&self) -> &str {
-        &self.message
+        &self.inner.message
     }
 }
 
-impl Hash for Formatted {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.message.hash(state);
-        self.code.hash(state);
-        self.span.hash(state);
-    }
+/// LSP-agnostic structured view of a compiler diagnostic.
+///
+/// Exposed so editor tooling — currently `leo-lsp` — can lower errors and
+/// warnings into editor-facing diagnostics without parsing rendered ariadne
+/// output. The view borrows from the originating [`Formatted`] for cheap
+/// strings while owning a small per-label `Vec`, which is the smallest shape
+/// that keeps secondary-label messages alive across an `extract_errs` call.
+#[derive(Debug, Clone)]
+pub struct DiagnosticView<'a> {
+    /// Primary human-readable message.
+    pub message: &'a str,
+    /// Optional help hint shown beneath the diagnostic on the CLI.
+    pub help: Option<&'a str>,
+    /// Optional follow-up note shown beneath the help line on the CLI.
+    pub note: Option<&'a str>,
+    /// Fully formatted code identifier (e.g. `EPAR0001` or `WTYC0001`).
+    pub code: String,
+    /// Whether the diagnostic is an error (`true`) or a warning (`false`).
+    pub is_error: bool,
+    /// Primary span, when the diagnostic ties to a concrete source location.
+    pub span: Option<Span>,
+    /// Secondary spans annotated with their own human-readable messages.
+    pub labels: Vec<DiagnosticLabelView>,
 }
 
-impl PartialEq for Formatted {
-    fn eq(&self, other: &Self) -> bool {
-        self.message == other.message && self.code == other.code && self.span == other.span
-    }
+/// One secondary label paired with its source span.
+///
+/// `leo-lsp` lowers each label into `Diagnostic.relatedInformation` when the
+/// client advertises support, so it captures both the span and the message.
+#[derive(Debug, Clone)]
+pub struct DiagnosticLabelView {
+    /// Human-readable description for the label.
+    pub message: String,
+    /// Span associated with the label, resolved against session source globals.
+    pub span: Span,
 }
 
-impl Eq for Formatted {}
+#[cfg(test)]
+mod tests {
+    use super::{Color, Formatted, Label};
+    use leo_span::{Span, create_session_if_not_set_then};
+
+    /// Verifies the structured view round-trips primary message, code, help, and note.
+    #[test]
+    fn diagnostic_view_exposes_primary_fields() {
+        create_session_if_not_set_then(|_| {
+            let span = Span::default();
+            let error = Formatted::error("TST", 1, "boom", span).with_help("try again").with_note("note text");
+
+            let view = error.diagnostic_view();
+            assert_eq!(view.message, "boom");
+            assert_eq!(view.help, Some("try again"));
+            assert_eq!(view.note, Some("note text"));
+            assert_eq!(view.code, error.error_code());
+            assert!(view.is_error);
+            assert_eq!(view.span, Some(span));
+            assert!(view.labels.is_empty());
+        });
+    }
+
+    /// Verifies labels are exposed with their messages and spans intact.
+    #[test]
+    fn diagnostic_view_exposes_secondary_labels() {
+        create_session_if_not_set_then(|_| {
+            let primary = Span::new(0, 4);
+            let label_span = Span::new(5, 10);
+            let error = Formatted::error("TST", 2, "boom", primary)
+                .with_label(Label::new(label_span).with_message("see also").with_color(Color::Blue));
+
+            let view = error.diagnostic_view();
+            assert_eq!(view.labels.len(), 1);
+            assert_eq!(view.labels[0].message, "see also");
+            assert_eq!(view.labels[0].span, label_span);
+        });
+    }
+
+    /// Verifies warnings round-trip through the structured view with severity preserved.
+    #[test]
+    fn diagnostic_view_marks_warnings() {
+        create_session_if_not_set_then(|_| {
+            let warning = Formatted::warning("TST", 3, "watch out", Span::default());
+            let view = warning.diagnostic_view();
+            assert!(!view.is_error);
+            assert_eq!(view.code, warning.warning_code());
+        });
+    }
+}

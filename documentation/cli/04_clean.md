@@ -15,6 +15,21 @@ leo clean
 ```
 
 ```bash title="console output:"
-  Leo 🧹 Cleaned the outputs directory (in "...")
   Leo 🧹 Cleaned the build directory (in "...")
+```
+
+## Workspace Behavior
+
+When run inside a [workspace](../guides/03_workspaces.md):
+
+- **From workspace root:** Cleans build artifacts for all members.
+- **From a member directory:** Cleans only that member.
+- **With `--package <NAME>`:** Cleans only the specified member.
+
+```bash
+# Clean all workspace members
+leo clean
+
+# Clean only the swap member
+leo clean -p swap
 ```

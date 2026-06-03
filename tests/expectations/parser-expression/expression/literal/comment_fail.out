@@ -1,73 +1,91 @@
-[EPAR0370050] Error: Could not lex the following content: `/*`.
-
+[EPAR0370050] Error: could not tokenize the following content: `/*`
    ╭─[ test_0:1:1 ]
    │
  1 │ /*
+   │ 
+   │ Help: Remove or replace the unrecognized characters. Only ASCII source is supported outside of string literals.
 ───╯
-[EPAR0370050] Error: Could not lex the following content: `/* test`.
-
+[EPAR0370050] Error: could not tokenize the following content: `/* test`
    ╭─[ test_1:1:1 ]
    │
  1 │ /* test
+   │ 
+   │ Help: Remove or replace the unrecognized characters. Only ASCII source is supported outside of string literals.
 ───╯
-[EPAR0370005] Error: expected an identifier, a program id, an address literal, an integer literal, a static string, '!', '-', '(', '[', 'true', 'false', 'final', 'block', 'network', 'self' -- found '/'
+[EPAR0370005] Error: expected an identifier, a program id, an address literal, an integer literal, a static string, '!', '-', '(', '[', 'true', 'false', 'final', 'block', 'network', 'self', found `/`
    ╭─[ test_2:1:1 ]
    │
  1 │ / /
+   │ 
+   │ Help: Replace the highlighted token with what the parser expects, or insert the missing syntax before it.
 ───╯
-[EPAR0370003] Error: unexpected EOF
+[EPAR0370003] Error: unexpected end of file
    ╭─[ test_3:1:4 ]
    │
  1 │ /*/
+   │ 
+   │ Help: The parser reached the end of the file while still expecting more input. Complete the current item. Common causes are a missing `}`, `)`, or `;`.
 ───╯
-[EPAR0370005] Error: expected an identifier, a program id, an address literal, an integer literal, a static string, '!', '-', '(', '[', 'true', 'false', 'final', 'block', 'network', 'self' -- found '*'
+[EPAR0370005] Error: expected an identifier, a program id, an address literal, an integer literal, a static string, '!', '-', '(', '[', 'true', 'false', 'final', 'block', 'network', 'self', found `*`
    ╭─[ test_4:1:1 ]
    │
  1 │ */
+   │ 
+   │ Help: Replace the highlighted token with what the parser expects, or insert the missing syntax before it.
 ───╯
-[EPAR0370050] Error: Could not lex the following content: `🦀`.
-
+[EPAR0370050] Error: could not tokenize the following content: `🦀`
    ╭─[ test_5:1:1 ]
    │
  1 │ 🦀**/
+   │ 
+   │ Help: Remove or replace the unrecognized characters. Only ASCII source is supported outside of string literals.
 ───╯
-[EPAR0370050] Error: Could not lex the following content: `🦀`.
-
+[EPAR0370050] Error: could not tokenize the following content: `🦀`
    ╭─[ test_6:1:2 ]
    │
+ 1 │ /🦀*/
    │ 
+   │ Help: Remove or replace the unrecognized characters. Only ASCII source is supported outside of string literals.
 ───╯
-[EPAR0370005] Error: expected an identifier, a program id, an address literal, an integer literal, a static string, '!', '-', '(', '[', 'true', 'false', 'final', 'block', 'network', 'self' -- found '/'
+[EPAR0370005] Error: expected an identifier, a program id, an address literal, an integer literal, a static string, '!', '-', '(', '[', 'true', 'false', 'final', 'block', 'network', 'self', found `/`
    ╭─[ test_6:1:1 ]
    │
  1 │ /🦀*/
+   │ 
+   │ Help: Replace the highlighted token with what the parser expects, or insert the missing syntax before it.
 ───╯
-[EPAR0370050] Error: Could not lex the following content: `/*🦀/`.
-
+[EPAR0370050] Error: could not tokenize the following content: `/*🦀/`
    ╭─[ test_7:1:1 ]
    │
  1 │ /*🦀/
+   │ 
+   │ Help: Remove or replace the unrecognized characters. Only ASCII source is supported outside of string literals.
 ───╯
-[EPAR0370050] Error: Could not lex the following content: `/**🦀`.
-
+[EPAR0370050] Error: could not tokenize the following content: `/**🦀`
    ╭─[ test_8:1:1 ]
    │
  1 │ /**🦀
+   │ 
+   │ Help: Remove or replace the unrecognized characters. Only ASCII source is supported outside of string literals.
 ───╯
-[EPAR0370050] Error: Could not lex the following content: `/*🦀`.
-
+[EPAR0370050] Error: could not tokenize the following content: `/*🦀`
    ╭─[ test_9:1:1 ]
    │
  1 │ /*🦀
+   │ 
+   │ Help: Remove or replace the unrecognized characters. Only ASCII source is supported outside of string literals.
 ───╯
-[EPAR0370050] Error: Could not lex the following content: `/*/*`.
-
+[EPAR0370050] Error: could not tokenize the following content: `/*/*`
    ╭─[ test_10:1:37 ]
    │
  1 │ /*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*
+   │ 
+   │ Help: Remove or replace the unrecognized characters. Only ASCII source is supported outside of string literals.
 ───╯
-[EPAR0370005] Error: expected an identifier, a program id, an address literal, an integer literal, a static string, '!', '-', '(', '[', 'true', 'false', 'final', 'block', 'network', 'self' -- found '*'
+[EPAR0370005] Error: expected an identifier, a program id, an address literal, an integer literal, a static string, '!', '-', '(', '[', 'true', 'false', 'final', 'block', 'network', 'self', found `*`
    ╭─[ test_10:1:6 ]
    │
  1 │ /*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*
+   │ 
+   │ Help: Replace the highlighted token with what the parser expects, or insert the missing syntax before it.
 ───╯

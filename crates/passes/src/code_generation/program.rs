@@ -16,6 +16,7 @@
 
 use super::*;
 
+use crate::errors::compiler as compiler_error_fns;
 use leo_ast::{
     Composite,
     Constructor,
@@ -31,7 +32,6 @@ use leo_ast::{
     UpgradeVariant,
     Variant,
 };
-use leo_errors::CompilerError;
 use leo_span::{Symbol, sym};
 
 use indexmap::IndexMap;
@@ -213,6 +213,8 @@ impl<'a> CodeGeneratingVisitor<'a> {
     fn visit_function_with(&mut self, function: &'a Function, futures: &[Location]) -> Option<AleoFunctional> {
         // Initialize the state of `self` with the appropriate values before visiting `function`.
         self.next_register = 0;
+        self.next_label = 0;
+        self.conditional_depth = 0;
         self.variable_mapping = IndexMap::new();
         self.variant = Some(function.variant);
         // TODO: Figure out a better way to initialize.
@@ -227,7 +229,9 @@ impl<'a> CodeGeneratingVisitor<'a> {
         // though it may already have been inlined.
         let function_name = match function.variant {
             Variant::FinalFn => return None,
-            Variant::EntryPoint => function.identifier.to_string(),
+            // EntryPoints and Views are externally-callable top-level components, so their
+            // bytecode names are the source identifier verbatim.
+            Variant::EntryPoint | Variant::View => function.identifier.to_string(),
             // Closures may carry monomorphized names like `foo::[5u32]` that aren't legal Aleo
             // identifiers, so legalize them.
             Variant::Fn => Self::legalize_path(&[function.identifier.name])
@@ -265,7 +269,7 @@ impl<'a> CodeGeneratingVisitor<'a> {
                     // Note that this unwrap is safe because we set the variant at the beginning of the function.
                     let visibility = match (self.variant.unwrap(), input.mode) {
                         (Variant::EntryPoint, Mode::None) => Some(AleoVisibility::Private),
-                        (Variant::Finalize, Mode::None) => Some(AleoVisibility::Public),
+                        (Variant::Finalize | Variant::View, Mode::None) => Some(AleoVisibility::Public),
                         (_, mode) => AleoVisibility::maybe_from(mode),
                     };
                     // Futures are displayed differently in the input section. `input r0 as foo.aleo/bar.future;`
@@ -303,8 +307,9 @@ impl<'a> CodeGeneratingVisitor<'a> {
         if matches!(self.variant.unwrap(), Variant::Fn | Variant::Finalize)
             && statements.iter().all(|stm| matches!(stm, AleoStmt::Output(..)))
         {
-            // There are no real instructions, which is invalid in Aleo, so
-            // add a dummy instruction.
+            // A closure or finalize body with only outputs has no real instructions, which is
+            // invalid in Aleo; insert a no-op `assert.eq true true` so the body parses. View
+            // bodies accept zero commands at the snarkVM level, so they don't need this.
             statements.insert(0, AleoStmt::AssertEq(AleoExpr::Bool(true), AleoExpr::Bool(true)));
         }
 
@@ -320,11 +325,10 @@ impl<'a> CodeGeneratingVisitor<'a> {
             let write_count =
                 statements.iter().filter(|s| matches!(s, AleoStmt::Set(..) | AleoStmt::Remove(..))).count();
             if write_count > max_writes as usize {
-                self.state.handler.emit_err(CompilerError::too_many_write_commands(
+                self.state.handler.emit_err(compiler_error_fns::too_many_write_commands(
                     write_count,
                     max_writes,
                     function.span,
-                    vec![],
                 ));
             }
         }
@@ -338,6 +342,7 @@ impl<'a> CodeGeneratingVisitor<'a> {
             Variant::Finalize => {
                 Some(AleoFunctional::Finalize(AleoFinalize { caller_name: function_name, inputs, statements }))
             }
+            Variant::View => Some(AleoFunctional::View(AleoView { name: function_name, inputs, statements })),
         }
     }
 
@@ -348,6 +353,8 @@ impl<'a> CodeGeneratingVisitor<'a> {
     fn visit_constructor(&mut self, constructor: &'a Constructor) -> AleoConstructor {
         // Initialize the state of `self` with the appropriate values before visiting `constructor`.
         self.next_register = 0;
+        self.next_label = 0;
+        self.conditional_depth = 0;
         self.variable_mapping = IndexMap::new();
         self.variant = Some(Variant::Finalize);
         // TODO: Figure out a better way to initialize.
@@ -418,7 +425,7 @@ impl<'a> CodeGeneratingVisitor<'a> {
         let write_count =
             constructor.statements.iter().filter(|s| matches!(s, AleoStmt::Set(..) | AleoStmt::Remove(..))).count();
         if write_count > max_writes as usize {
-            self.state.handler.emit_err(CompilerError::too_many_write_commands(write_count, max_writes, span, vec![]));
+            self.state.handler.emit_err(compiler_error_fns::too_many_write_commands(write_count, max_writes, span));
         } else {
             // Validate with snarkVM. Any violation not already caught above is a compiler bug.
             if let Err(e) = match self.state.network {

@@ -23,16 +23,29 @@ mod compiler_bridge;
 mod document_store;
 mod features;
 mod panic_boundary;
+mod pending;
 mod project_model;
+mod response_pool;
 mod scheduler;
 mod semantics;
 mod server;
 mod syntax_semantics;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use lsp_server::Connection;
 use std::process::ExitCode;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+/// Standalone `leo-lsp` CLI parser.
+///
+/// The language server communicates over stdio and takes no arguments of its
+/// own; this parser exists so the binary honors `--version`/`-V` and `--help`
+/// like the `leo` and `leo-fmt` binaries. Editor clients launch the server with
+/// no arguments, so strict parsing does not affect how they spawn it.
+#[derive(Debug, Parser)]
+#[command(name = "leo-lsp", version, about = "Language server for the Leo programming language", long_about = None)]
+struct LeoLspCli {}
 
 /// Run the Leo language server over stdio.
 ///
@@ -67,6 +80,10 @@ pub fn run_server(connection: Connection) -> Result<ExitCode> {
 /// This keeps the binary wrapper thin while preserving the library-oriented
 /// `Result`-returning entrypoints for tests, embeddings, and future plugins.
 pub fn run_standalone() -> ExitCode {
+    // Parse CLI arguments so the binary honors `--version` and `--help`. The
+    // server itself takes no arguments and communicates over stdio.
+    LeoLspCli::parse();
+
     match run_stdio() {
         Ok(exit_code) => exit_code,
         Err(error) => {
@@ -76,6 +93,7 @@ pub fn run_standalone() -> ExitCode {
     }
 }
 
+/// Initialize stderr logging once for the process.
 fn init_logging() {
     // LSP servers must keep stdout reserved for protocol traffic, so route all
     // diagnostics through a best-effort stderr subscriber.

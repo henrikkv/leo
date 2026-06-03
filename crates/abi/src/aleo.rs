@@ -91,8 +91,15 @@ pub fn generate(aleo: &ast::AleoProgram) -> abi::Program {
         .map(|(_, f)| convert_function_stub(f, &record_names))
         .collect();
 
+    let views = aleo
+        .functions
+        .iter()
+        .filter(|(_, f)| f.variant.is_view())
+        .map(|(_, f)| convert_function_stub(f, &record_names))
+        .collect();
+
     let mut program =
-        abi::Program { program, implements: vec![], structs, records, mappings, storage_variables, functions };
+        abi::Program { program, implements: vec![], structs, records, mappings, storage_variables, functions, views };
 
     // Prune types not used in the public interface.
     prune_non_interface_types(&mut program);
@@ -177,7 +184,7 @@ mod tests {
 
     const SIMPLE_ALEO: &str = include_str!("../../../tests/tests/cli/test_abi_from_aleo/contents/simple.aleo");
     const SIMPLE_ABI: &str =
-        include_str!("../../../tests/expectations/cli/test_abi_from_aleo/contents/simple.abi.json");
+        include_str!("../../../tests/expectations/cli/test_abi_from_aleo/contents/simple_out/simple.aleo.abi.json");
 
     #[test]
     fn generate_from_bytecode_matches_existing_cli_fixture() {

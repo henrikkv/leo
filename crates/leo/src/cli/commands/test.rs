@@ -62,6 +62,51 @@ impl Command for LeoTest {
     fn apply(self, _: Context, input: Self::Input) -> Result<Self::Output> {
         handle_test(self, input)
     }
+
+    fn execute(self, context: Context) -> Result<Self::Output> {
+        // Check for workspace mode before falling through to the default
+        // prelude+apply flow, because test needs to build and test each
+        // member independently.
+        match context.resolve_targets()? {
+            Some(targets) if targets.len() > 1 => {
+                let mut aggregate = TestOutput::default();
+                for target in &targets {
+                    let member_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    println!("\n--- workspace member '{member_name}' ---");
+
+                    let member_ctx = context.with_path(target.clone());
+
+                    // Build with tests.
+                    let mut opts = self.compiler_options.clone();
+                    opts.build_tests = true;
+                    let package =
+                        (LeoBuild { env_override: self.env_override.clone(), options: opts }).execute(member_ctx)?;
+
+                    // Run tests for this member.
+                    let member_test = LeoTest {
+                        test_name: self.test_name.clone(),
+                        prove: self.prove,
+                        compiler_options: self.compiler_options.clone(),
+                        env_override: self.env_override.clone(),
+                    };
+                    let result = handle_test(member_test, package)?;
+                    aggregate.passed += result.passed;
+                    aggregate.failed += result.failed;
+                    aggregate.tests.extend(result.tests);
+                }
+                Ok(aggregate)
+            }
+            _ => {
+                // Single target or no workspace - use the normal flow.
+                let input = self.prelude(context.clone())?;
+                let span = self.log_span();
+                let span = span.enter();
+                let out = self.apply(context, input);
+                drop(span);
+                out
+            }
+        }
+    }
 }
 
 struct TestFunction {
@@ -154,7 +199,7 @@ fn discover_test_functions(package: &Package, match_str: &str, network: NetworkN
 
 fn handle_test(command: LeoTest, package: Package) -> Result<TestOutput> {
     if package.compilation_units.last().map(|p| p.kind.is_library()).unwrap_or(false) {
-        return Err(CliError::custom("`leo test` is not supported for library packages.").into());
+        return Err(crate::errors::custom("`leo test` is not supported for library packages.").into());
     }
 
     // Get the private key.
@@ -162,9 +207,6 @@ fn handle_test(command: LeoTest, package: Package) -> Result<TestOutput> {
 
     let network = command.env_override.network.unwrap_or(NetworkName::TestnetV0);
     let test_functions = discover_test_functions(&package, &command.test_name, network)?;
-
-    let program_name_symbol = Symbol::intern(&package.manifest.program);
-    let build_directory = package.build_directory();
 
     let credits = Symbol::intern("credits.aleo");
 
@@ -177,19 +219,15 @@ fn handle_test(command: LeoTest, package: Package) -> Result<TestOutput> {
             if unit.name == credits {
                 return None;
             }
-            // Libraries have no bytecode — their consts are inlined into the main program.
+            // Libraries have no bytecode - their consts are inlined into the main program.
             if unit.kind.is_library() {
                 return None;
             }
             let bytecode = match &unit.data {
                 ProgramData::Bytecode(c) => c.clone(),
                 ProgramData::SourcePath { .. } => {
-                    // This was not a network dependency, so get its bytecode from the filesystem.
-                    let aleo_path = if unit.name == program_name_symbol {
-                        build_directory.join("main.aleo")
-                    } else {
-                        package.imports_directory().join(format!("{}", unit.name))
-                    };
+                    // This was not a network dependency, so get its bytecode from its build directory.
+                    let aleo_path = package.unit_bytecode_path(&unit.name.to_string());
                     fs::read_to_string(&aleo_path)
                         .unwrap_or_else(|e| panic!("Failed to read Aleo file at {}: {}", aleo_path.display(), e))
                 }
@@ -207,6 +245,7 @@ fn handle_test(command: LeoTest, package: Package) -> Result<TestOutput> {
                 function: tf.function,
                 private_key: tf.private_key,
                 input: Vec::new(),
+                seed_mapping: Vec::new(),
             }]
         })
         .collect();

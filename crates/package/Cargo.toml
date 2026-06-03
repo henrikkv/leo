@@ -1,6 +1,6 @@
 [package]
 name = "leo-package"
-version = "4.0.2"
+version = "4.1.0"
 authors = [ "The Leo Team <leo@provable.com>" ]
 description = "Package parser for the Leo programming language"
 homepage = "https://leo-lang.org"
@@ -23,6 +23,7 @@ leo-ast     = { workspace = true }
 leo-errors  = { workspace = true }
 leo-span    = { workspace = true }
 # third party dependencies
+glob        = { workspace = true }
 indexmap    = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }

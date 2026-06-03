@@ -1,43 +1,71 @@
-[ECHI03712004] Error: Function `transfer` does not match the signature required by interface `lib.aleo/HasToken`.
+[ECHI03712004] Error: function `transfer` does not match the signature required by interface `lib.aleo/HasToken`
 Expected:
 fn transfer(t: lib.aleo::Token) -> lib.aleo::Token
 Found:
 fn transfer(t: other.aleo::Token) -> other.aleo::Token
    ╭─[ compiler-test:6:5 ]
    │
-   │ 
-   │ 
-   │ Help: Function signatures must match exactly: same parameter types, modes, order, and return type.
+ 6 │ ╭─▶     fn transfer(t: other.aleo::Token) -> other.aleo::Token {
+   ┆ ┆   
+ 8 │ ├─▶     }
+   │ │           
+   │ ╰─────────── 
+   │     
+   │     Help: Function signatures must match exactly: same parameter types, modes, order, and return type.
 ───╯
-[ECHI03712003] Error: Program `test.aleo` implements interface `lib.aleo/HasToken` but is missing the required record `Token`.
+[ECHI03712003] Error: program `test.aleo` implements interface `lib.aleo/HasToken` but is missing the required record `Token`
     ╭─[ compiler-test:5:1 ]
     │
-    ┆ 
-    │ 
-    │ Help: Add a record definition with the specified name.
+  5 │ ╭─▶ program test.aleo: lib.aleo::HasToken {
+    ┆ ┆   
+ 11 │ ├─▶ }
+    │ │       
+    │ ╰─────── 
+    │     
+    │     Help: Add a `record Token` definition matching the shape declared by `lib.aleo/HasToken`.
 ────╯
-[WPAR0370002] Warning: Record prototype `Token` does not constrain any fields beyond the implicit `owner: address`. Consider simplifying to `record Token;`.
+[WPAR0370002] Warning: record prototype `Token` does not constrain any fields beyond the implicit `owner: address`
     ╭─[ compiler-test:7:21 ]
     │
-    │ 
+  7 │ ╭─▶ interface HasToken {
+    ┆ ┆   
+ 11 │ ├─▶     }
+    │ │           
+    │ ╰─────────── 
+    │     
+    │     Help: Simplify the declaration to `record Token;`.
 ────╯
 
 
 ---
 Note: Treating dependencies as Aleo produces different results:
 
-[ETYC0372083] Error: A program must have at least one entry point fn.
+[ETYC0372083] Error: a program must have at least one entry point fn
    ╭─[ compiler-test:4:9 ]
    │
  4 │ program other.aleo {
+   │ 
+   │ Help: Define at least one function inside the `program` block.
 ───╯
-[WPAR0370002] Warning: Record prototype `Token` does not constrain any fields beyond the implicit `owner: address`. Consider simplifying to `record Token;`.
+[WPAR0370002] Warning: record prototype `Token` does not constrain any fields beyond the implicit `owner: address`
     ╭─[ compiler-test:7:21 ]
     │
-    │ 
+  7 │ ╭─▶ interface HasToken {
+    ┆ ┆   
+ 11 │ ├─▶     }
+    │ │           
+    │ ╰─────────── 
+    │     
+    │     Help: Simplify the declaration to `record Token;`.
 ────╯
-[WPAR0370002] Warning: Record prototype `Token` does not constrain any fields beyond the implicit `owner: address`. Consider simplifying to `record Token;`.
+[WPAR0370002] Warning: record prototype `Token` does not constrain any fields beyond the implicit `owner: address`
     ╭─[ compiler-test:7:21 ]
     │
-    │ 
+  7 │ ╭─▶ interface HasToken {
+    ┆ ┆   
+ 11 │ ├─▶     }
+    │ │           
+    │ ╰─────────── 
+    │     
+    │     Help: Simplify the declaration to `record Token;`.
 ────╯

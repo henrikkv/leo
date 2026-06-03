@@ -18,12 +18,21 @@
 //!
 //! The [`Compiler`] type compiles Leo programs into R1CS circuits.
 
-use crate::{AstSnapshots, CompilerOptions};
+use crate::{AstSnapshots, CompilerOptions, errors};
 
 use leo_ast::{AleoProgram, FunctionStub, Identifier, Library, NetworkName, NodeBuilder, ProgramId, Stub};
 pub use leo_ast::{Ast, DiGraph, Program};
-use leo_errors::{CompilerError, Handler, PackageError, Result};
-use leo_package::{CompilationUnit, Dependency, Location, MANIFEST_FILENAME, Manifest, PackageKind, ProgramData};
+use leo_errors::{Handler, Result};
+use leo_package::{
+    CompilationUnit,
+    Dependency,
+    Location,
+    MANIFEST_FILENAME,
+    Manifest,
+    PackageKind,
+    ProgramData,
+    resolve_workspace_dependency,
+};
 use leo_passes::*;
 use leo_span::{
     Span,
@@ -137,7 +146,7 @@ impl Compiler {
         let program_scope = program.program_scopes.values().next().unwrap();
         if let Some(unit_name) = &self.unit_name {
             if unit_name != &program_scope.program_id.as_symbol().to_string() {
-                return Err(CompilerError::program_name_should_match_file_name(
+                return Err(crate::errors::program_name_should_match_file_name(
                     program_scope.program_id.as_symbol(),
                     // If this is a test, use the filename as the expected name.
                     if self.state.is_test {
@@ -149,7 +158,6 @@ impl Compiler {
                         format!("`{unit_name}` (specified in `program.json`)")
                     },
                     program_scope.program_id.span(),
-                    vec![],
                 )
                 .into());
             }
@@ -375,11 +383,13 @@ impl Compiler {
         self.do_pass_with_check::<CheckInterfaces, _>((), &mut should_continue)?;
         self.do_pass_with_check::<TypeChecking, _>(TypeCheckingInput::new(self.state.network), &mut should_continue)?;
         self.do_pass_with_check::<Disambiguate, _>((), &mut should_continue)?;
+        self.do_pass_with_check::<CeiAnalyzing, _>((), &mut should_continue)?;
         self.do_pass_with_check::<ProcessingAsync, _>(
             TypeCheckingInput::new(self.state.network),
             &mut should_continue,
         )?;
-        self.do_pass_with_check::<StaticAnalyzing, _>((), &mut should_continue)
+        self.do_pass_with_check::<StaticAnalyzing, _>((), &mut should_continue)?;
+        Ok(())
     }
 
     /// Runs the compiler stages.
@@ -505,7 +515,9 @@ impl Compiler {
         // Run the intermediate compiler stages, which also generates ABIs.
         let (primary_abi, import_abis, interfaces) = self.intermediate_passes()?;
         // Run code generation.
-        let bytecodes = CodeGenerating::do_pass((), &mut self.state)?;
+        let generated = self.do_pass::<CodeGenerating>(())?;
+        // Run peephole optimization and serialize to bytecode.
+        let bytecodes = self.do_pass::<PeepholeOptimizing>(generated)?;
 
         // Build the primary compiled program.
         let primary = CompiledProgram {
@@ -553,17 +565,17 @@ impl Compiler {
         // Read the contents of the main source file.
         let source = file_source
             .read_file(entry_file_path)
-            .map_err(|e| CompilerError::file_read_error(entry_file_path.display().to_string(), e))?;
+            .map_err(|e| crate::errors::file_read_error(entry_file_path.display().to_string(), e))?;
 
         let files = file_source
             .list_leo_files(source_directory, entry_file_path)
-            .map_err(|e| CompilerError::file_read_error(source_directory.display().to_string(), e))?;
+            .map_err(|e| crate::errors::file_read_error(source_directory.display().to_string(), e))?;
 
         let mut modules = Vec::with_capacity(files.len());
         for path in files {
             let module_source = file_source
                 .read_file(&path)
-                .map_err(|e| CompilerError::file_read_error(path.display().to_string(), e))?;
+                .map_err(|e| crate::errors::file_read_error(path.display().to_string(), e))?;
             modules.push((module_source, FileName::Real(path)));
         }
 
@@ -663,22 +675,18 @@ impl Compiler {
         }
     }
 
-    /// Writes the AST to a JSON file.
-    fn write_ast_to_json(&self, file_suffix: &str) -> Result<()> {
+    /// Writes the AST to a JSON file under the unit's snapshots directory.
+    fn write_ast_to_json(&self, filename: &str) -> Result<()> {
         match &self.state.ast {
             Ast::Program(program) => {
+                // Snapshots are opt-in; create the directory lazily on first write.
+                fs::create_dir_all(&self.output_directory)
+                    .map_err(|e| crate::errors::failed_ast_file(self.output_directory.display(), e))?;
                 // Remove `Span`s if they are not enabled.
                 if self.compiler_options.ast_spans_enabled {
-                    program.to_json_file(
-                        self.output_directory.clone(),
-                        &format!("{}.{file_suffix}", self.unit_name.as_ref().unwrap()),
-                    )?;
+                    program.to_json_file(self.output_directory.clone(), filename)?;
                 } else {
-                    program.to_json_file_without_keys(
-                        self.output_directory.clone(),
-                        &format!("{}.{file_suffix}", self.unit_name.as_ref().unwrap()),
-                        &["_span", "span"],
-                    )?;
+                    program.to_json_file_without_keys(self.output_directory.clone(), filename, &["_span", "span"])?;
                 }
             }
             Ast::Library(_) => {
@@ -688,17 +696,19 @@ impl Compiler {
         Ok(())
     }
 
-    /// Writes the AST to a file (Leo syntax, not JSON).
-    fn write_ast(&self, file_suffix: &str) -> Result<()> {
-        let filename = format!("{}.{file_suffix}", self.unit_name.as_ref().unwrap());
-        let full_filename = self.output_directory.join(&filename);
+    /// Writes the AST to a file (Leo syntax, not JSON) under the unit's snapshots directory.
+    fn write_ast(&self, filename: &str) -> Result<()> {
+        // Snapshots are opt-in; create the directory lazily on first write.
+        fs::create_dir_all(&self.output_directory)
+            .map_err(|e| crate::errors::failed_ast_file(self.output_directory.display(), e))?;
+        let full_filename = self.output_directory.join(filename);
 
         let contents = match &self.state.ast {
             Ast::Program(program) => program.to_string(),
             Ast::Library(_) => String::new(), // empty for libraries
         };
 
-        fs::write(&full_filename, contents).map_err(|e| CompilerError::failed_ast_file(full_filename.display(), e))?;
+        fs::write(&full_filename, contents).map_err(|e| crate::errors::failed_ast_file(full_filename.display(), e))?;
 
         Ok(())
     }
@@ -774,11 +784,10 @@ impl Compiler {
 
             // Look up the corresponding stub.
             let Some(stub) = self.import_stubs.get(&import_symbol) else {
-                return Err(CompilerError::imported_program_not_found(
+                return Err(crate::errors::imported_program_not_found(
                     self.unit_name.as_ref().unwrap(),
                     import_symbol,
                     span,
-                    vec![],
                 )
                 .into());
             };
@@ -902,7 +911,7 @@ pub fn load_import_stubs_for_package_with_file_source(
 ) -> Result<LoadedImportStubs> {
     create_session_if_not_set_then(|_| {
         let package_root =
-            package_root.canonicalize().map_err(|error| PackageError::failed_path(package_root.display(), error))?;
+            package_root.canonicalize().map_err(|error| crate::errors::failed_path(package_root.display(), error))?;
         let declared_dependencies = collect_local_declared_dependencies(&package_root)?;
         let mut import_stubs = IndexMap::new();
         let mut watch_paths = vec![package_root.join(MANIFEST_FILENAME)];
@@ -966,6 +975,12 @@ fn collect_local_declared_dependencies_recursive(
 ) -> Result<()> {
     for dependency in manifest.dependencies.iter().flatten() {
         let dependency = normalize_local_dependency(base_path, dependency.clone())?;
+        // Resolve workspace deps early - converts to Location::Local with an absolute path.
+        let dependency = if dependency.location == Location::Workspace {
+            resolve_workspace_dependency(base_path, dependency)?
+        } else {
+            dependency
+        };
         if dependency.location != Location::Local {
             continue;
         }
@@ -997,7 +1012,7 @@ fn normalize_local_dependency(base_path: &Path, mut dependency: Dependency) -> R
         && !path.is_absolute()
     {
         let joined = base_path.join(&*path);
-        *path = joined.canonicalize().map_err(|error| PackageError::failed_path(joined.display(), error))?;
+        *path = joined.canonicalize().map_err(|error| crate::errors::failed_path(joined.display(), error))?;
     }
 
     Ok(dependency)
@@ -1015,7 +1030,7 @@ fn unit_watch_paths(unit: &CompilationUnit, file_source: &impl FileSource) -> Re
         collect_source_directories(&source_directory, &mut watch_paths)?;
         let mut modules = file_source
             .list_leo_files(&source_directory, source)
-            .map_err(|error| CompilerError::file_read_error(source_directory.display().to_string(), error))?;
+            .map_err(|error| crate::errors::file_read_error(source_directory.display().to_string(), error))?;
         watch_paths.append(&mut modules);
     }
 
@@ -1024,8 +1039,8 @@ fn unit_watch_paths(unit: &CompilationUnit, file_source: &impl FileSource) -> Re
 
 /// Collect source directories whose mtimes signal nested module creation/removal.
 fn collect_source_directories(dir: &Path, watch_paths: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(dir).map_err(|error| CompilerError::file_read_error(dir.display().to_string(), error))? {
-        let entry = entry.map_err(|error| CompilerError::file_read_error(dir.display().to_string(), error))?;
+    for entry in fs::read_dir(dir).map_err(|error| errors::file_read_error(dir.display().to_string(), error))? {
+        let entry = entry.map_err(|error| errors::file_read_error(dir.display().to_string(), error))?;
         let path = entry.path();
         if path.is_dir() {
             // Watching only existing `.leo` files misses the first file added to
@@ -1138,19 +1153,19 @@ fn extract_program_interface_stub(_program_name: Symbol, program: &Program) -> S
 fn disassemble_dependency_bytecode(program_name: Symbol, bytecode: &str, network: NetworkName) -> Result<Stub> {
     let disassembled = match network {
         NetworkName::MainnetV0 => {
-            leo_disassembler::disassemble_from_str::<snarkvm::prelude::MainnetV0>(program_name, bytecode)
+            leo_disassembler::disassemble_from_str_unchecked::<snarkvm::prelude::MainnetV0>(program_name, bytecode)
         }
         NetworkName::TestnetV0 => {
-            leo_disassembler::disassemble_from_str::<snarkvm::prelude::TestnetV0>(program_name, bytecode)
+            leo_disassembler::disassemble_from_str_unchecked::<snarkvm::prelude::TestnetV0>(program_name, bytecode)
         }
         NetworkName::CanaryV0 => {
-            leo_disassembler::disassemble_from_str::<snarkvm::prelude::CanaryV0>(program_name, bytecode)
+            leo_disassembler::disassemble_from_str_unchecked::<snarkvm::prelude::CanaryV0>(program_name, bytecode)
         }
     };
 
     disassembled
         .map(Into::into)
-        .map_err(|err| CompilerError::file_read_error(format!("dependency bytecode for `{program_name}`"), err).into())
+        .map_err(|err| crate::errors::file_read_error(format!("dependency bytecode for `{program_name}`"), err).into())
 }
 
 #[cfg(test)]

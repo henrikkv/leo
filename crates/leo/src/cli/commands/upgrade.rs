@@ -116,13 +116,13 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
     package: Package,
 ) -> Result<<LeoDeploy as Command>::Output> {
     if package.compilation_units.last().map(|p| p.kind.is_library()).unwrap_or(false) {
-        return Err(CliError::custom("`leo upgrade` is not supported for library packages.").into());
+        return Err(crate::errors::custom("`leo upgrade` is not supported for library packages.").into());
     }
 
     // Get the private key and associated address, accounting for overrides.
     let private_key = get_private_key(&command.env_override.private_key)?;
     let address =
-        Address::try_from(&private_key).map_err(|e| CliError::custom(format!("Failed to parse address: {e}")))?;
+        Address::try_from(&private_key).map_err(|e| crate::errors::custom(format!("Failed to parse address: {e}")))?;
 
     // Get the endpoint, accounting for overrides.
     let endpoint = get_endpoint(&command.env_override.endpoint)?;
@@ -135,7 +135,7 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
         command.env_override.consensus_heights.clone().unwrap_or_else(|| get_consensus_heights(network, is_devnet));
     // Validate the provided consensus heights.
     validate_consensus_heights(&consensus_heights)
-        .map_err(|e| CliError::custom(format!("Invalid consensus heights: {e}")))?;
+        .map_err(|e| crate::errors::custom(format!("Invalid consensus heights: {e}")))?;
     // Print the consensus heights being used.
     let consensus_heights_string = consensus_heights.iter().format(",").to_string();
     println!(
@@ -163,18 +163,11 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
             let bytecode = match &program.data {
                 ProgramData::Bytecode(s) => s.clone(),
                 ProgramData::SourcePath { .. } => {
-                    // We need to read the bytecode from the filesystem.
-                    let aleo_name = format!("{}", program.name);
-                    let aleo_path = if package.manifest.program == aleo_name {
-                        // The main program in the package, so its .aleo file
-                        // will be in the build directory.
-                        package.build_directory().join("main.aleo")
-                    } else {
-                        // Some other dependency, so look in `imports`.
-                        package.imports_directory().join(aleo_name)
-                    };
-                    fs::read_to_string(aleo_path.clone())
-                        .map_err(|e| CliError::custom(format!("Failed to read file {}: {e}", aleo_path.display())))?
+                    // We need to read the bytecode from its own build directory.
+                    let aleo_path = package.unit_bytecode_path(&program.name.to_string());
+                    fs::read_to_string(aleo_path.clone()).map_err(|e| {
+                        crate::errors::custom(format!("Failed to read file {}: {e}", aleo_path.display()))
+                    })?
                 }
             };
 
@@ -190,11 +183,12 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
         .zip(fee_options)
         .map(|((program, bytecode), (_base_fee, priority_fee, record))| {
             let id_str = format!("{}", program.name);
-            let id =
-                id_str.parse().map_err(|e| CliError::custom(format!("Failed to parse program ID {id_str}: {e}")))?;
+            let id = id_str
+                .parse()
+                .map_err(|e| crate::errors::custom(format!("Failed to parse program ID {id_str}: {e}")))?;
             let bytecode_size = bytecode.len();
             let parsed_program =
-                bytecode.parse().map_err(|e| CliError::custom(format!("Failed to parse program: {e}")))?;
+                bytecode.parse().map_err(|e| crate::errors::custom(format!("Failed to parse program: {e}")))?;
             Ok(Task {
                 id,
                 program: parsed_program,
@@ -261,7 +255,7 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
     }
 
     // Initialize an RNG.
-    let rng = &mut rand::thread_rng();
+    let rng = &mut rand::rng();
 
     // Initialize a new VM.
     let vm = VM::from(ConsensusStore::<N, ConsensusMemory<N>>::open(StorageMode::Production)?)?;
@@ -286,8 +280,8 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
             panic!("Expected bytecode when fetching a remote program");
         };
         // Parse the program bytecode.
-        let bytecode =
-            Program::<N>::from_str(&bytecode).map_err(|e| CliError::custom(format!("Failed to parse program: {e}")))?;
+        let bytecode = Program::<N>::from_str(&bytecode)
+            .map_err(|e| crate::errors::custom(format!("Failed to parse program: {e}")))?;
         // Program::fetch should always set the edition after a successful fetch.
         let edition = program.edition.expect("Edition should be set after successful fetch");
         programs_and_editions.push((bytecode, edition));
@@ -296,12 +290,12 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
     // Check for programs that violate edition/constructor requirements.
     check_edition_constructor_requirements(&programs_and_editions, consensus_version, "upgrade")?;
 
-    vm.process().write().add_programs_with_editions(&programs_and_editions)?;
+    vm.process().lock().add_programs_with_editions(&programs_and_editions)?;
 
     // Print the programs and their editions in the VM.
     println!("Loaded the following programs into the VM:");
-    for program_id in vm.process().read().program_ids() {
-        let edition = *vm.process().read().get_stack(program_id)?.program_edition();
+    for program_id in vm.process().program_ids() {
+        let edition = *vm.process().get_stack(program_id)?.program_edition();
         if program_id.to_string() == "credits.aleo" {
             println!(" - credits.aleo (default)");
         } else {
@@ -314,7 +308,7 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
     let query = SnarkVMQuery::<N, BlockMemory<N>>::from(
         endpoint
             .parse::<Uri>()
-            .map_err(|e| CliError::custom(format!("Failed to parse endpoint URI '{endpoint}': {e}")))?,
+            .map_err(|e| crate::errors::custom(format!("Failed to parse endpoint URI '{endpoint}': {e}")))?,
     );
 
     // For each of the programs, generate a deployment transaction.
@@ -327,7 +321,7 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
             let (transaction, stats) = if command.skip_deploy_certificate {
                 println!("⚠️  Skipping deployment certificate generation as per user request.\n");
                 // Increment the edition from the existing on-chain program.
-                let edition = *vm.process().read().get_stack(id)?.program_edition() + 1;
+                let edition = *vm.process().get_stack(id)?.program_edition() + 1;
                 println!("edition for deployed program: {}", edition);
                 deploy_with_placeholder_certificate::<N, A, _>(
                     &vm,
@@ -347,11 +341,11 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
                 // Generate the transaction.
                 let transaction = vm
                     .deploy(&private_key, &program, record, priority_fee.unwrap_or(0), Some(&query), rng)
-                    .map_err(|e| CliError::custom(format!("Failed to generate deployment transaction: {e}")))?;
+                    .map_err(|e| crate::errors::custom(format!("Failed to generate deployment transaction: {e}")))?;
                 // Get the deployment.
                 let deployment = transaction.deployment().expect("Expected a deployment in the transaction");
                 // Add the program to the VM before calculating function costs.
-                vm.process().write().add_program(&program)?;
+                vm.process().lock().add_program(&program)?;
                 // Compute the deployment stats.
                 let stats =
                     compute_deployment_stats(&vm, deployment, priority_fee, consensus_version, bytecode_size, rng)?;
@@ -366,7 +360,7 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
             all_stats.push(stats);
         }
         // Add the program to the VM (idempotent; ensures skipped programs are available for later imports).
-        if let Err(e) = vm.process().write().add_program(&program) {
+        if let Err(e) = vm.process().lock().add_program(&program) {
             warn_and_confirm(&format!("Failed to add program {id} to the VM. Error: {e}"), command.extra.yes)?;
         }
     }
@@ -377,7 +371,7 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
         for (program_name, transaction) in transactions.iter() {
             // Pretty-print the transaction.
             let transaction_json = serde_json::to_string_pretty(transaction)
-                .map_err(|e| CliError::custom(format!("Failed to serialize transaction: {e}")))?;
+                .map_err(|e| crate::errors::custom(format!("Failed to serialize transaction: {e}")))?;
             println!("🖨️ Printing deployment for {program_name}\n{transaction_json}")
         }
     }
@@ -387,15 +381,15 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
     // The directory is created if it doesn't exist.
     if let Some(path) = &command.action.save {
         // Create the directory if it doesn't exist.
-        std::fs::create_dir_all(path).map_err(|e| CliError::custom(format!("Failed to create directory: {e}")))?;
+        std::fs::create_dir_all(path).map_err(|e| crate::errors::custom(format!("Failed to create directory: {e}")))?;
         for (program_name, transaction) in transactions.iter() {
             // Save the transaction to a file.
             let file_path = PathBuf::from(path).join(format!("{program_name}.deployment.json"));
             println!("💾 Saving deployment for {program_name} at {}", file_path.display());
             let transaction_json = serde_json::to_string_pretty(transaction)
-                .map_err(|e| CliError::custom(format!("Failed to serialize transaction: {e}")))?;
+                .map_err(|e| crate::errors::custom(format!("Failed to serialize transaction: {e}")))?;
             std::fs::write(file_path, transaction_json)
-                .map_err(|e| CliError::custom(format!("Failed to write transaction to file: {e}")))?;
+                .map_err(|e| crate::errors::custom(format!("Failed to write transaction to file: {e}")))?;
         }
     }
 
@@ -536,6 +530,10 @@ fn check_tasks_for_warnings<N: Network>(
         // Check if the program uses V9 features.
         if consensus_version < ConsensusVersion::V9 && program.contains_v9_syntax() {
             warnings.push(format!("The program '{id}' uses V9 features but the consensus version is less than V9. The upgrade will likely fail"));
+        }
+        // Check if the program uses V15 features (e.g., `view` blocks).
+        if consensus_version < ConsensusVersion::V15 && program.contains_v15_syntax() {
+            warnings.push(format!("The program '{id}' uses V15 features (e.g., `view fn`) but the consensus version is less than V15. The upgrade will likely fail"));
         }
         // Check if the program contains a constructor.
         if consensus_version >= ConsensusVersion::V9 && !program.contains_constructor() {

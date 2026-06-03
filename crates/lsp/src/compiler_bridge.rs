@@ -27,7 +27,7 @@
 
 use crate::{
     document_store::{AnalysisBucket, DocumentSnapshot, DocumentViewSnapshot, OpenFileOverlay},
-    features::semantic_tokens::encode_tokens,
+    features::{diagnostics::CompilerDiagnostic, lsp_range::hash_text, semantic_tokens::encode_tokens},
     project_model::ProjectContext,
     semantics::{
         CachedDocumentView,
@@ -119,10 +119,24 @@ pub struct PackageWorkerAnalysis {
 }
 
 /// Worker-local cache of package dependency stubs.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PackageAnalysisCache {
     entries: HashMap<PathBuf, PackageAnalysisCacheEntry>,
     order: VecDeque<PathBuf>,
+    network_sentinel: Arc<PathBuf>,
+    library_sentinel: Arc<PathBuf>,
+}
+
+impl Default for PackageAnalysisCache {
+    /// Create an empty worker-local cache with stable virtual roots for stubs.
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            network_sentinel: Arc::new(PathBuf::from("leo-vfs:network")),
+            library_sentinel: Arc::new(PathBuf::from("leo-vfs:library")),
+        }
+    }
 }
 
 /// One cached package entry, including both the imported stubs and the
@@ -138,6 +152,8 @@ struct PackageAnalysisCacheEntry {
     /// lowering one worker result, so `fingerprints_with` builds that transient
     /// map at the boundary where it is actually useful.
     fingerprints: Arc<[(PathBuf, SourceFingerprint)]>,
+    /// Program roots keyed by both manifest import names and leaf identifiers.
+    dependency_roots: Arc<HashMap<Symbol, Arc<PathBuf>>>,
     /// Filesystem inputs whose metadata changes invalidate `import_stubs`.
     watch_paths: Arc<[PathBuf]>,
     /// Per-path revision memo reused to avoid rehashing unchanged watched inputs.
@@ -157,6 +173,8 @@ struct CachedImportStubs {
     import_stubs: Arc<IndexMap<Symbol, leo_ast::Stub>>,
     /// Sorted slice instead of a cached hash table to keep package caches lean.
     fingerprints: Arc<[(PathBuf, SourceFingerprint)]>,
+    /// Resolved roots used to make program namespace identities collision-free.
+    dependency_roots: Arc<HashMap<Symbol, Arc<PathBuf>>>,
 }
 
 /// Memoized revision for one watched path.
@@ -182,11 +200,74 @@ enum WatchedPathStamp {
     Directory { modified_nanos: u128 },
 }
 
-/// Compiler occurrences plus source fingerprints captured by the file source.
+/// Compiler frontend outputs lowered into LSP-friendly shapes.
+///
+/// `occurrences` is `None` when the frontend bailed before walking the AST;
+/// the caller falls back to syntax-only highlighting but still publishes the
+/// buffered diagnostics. Span resolution happens here, inside the live Leo
+/// session, because the source map is gone once the session ends.
 #[derive(Debug)]
 struct CompilerOutput {
-    occurrences: Vec<SymbolOccurrence>,
+    occurrences: Option<Vec<SymbolOccurrence>>,
     fingerprints: HashMap<PathBuf, SourceFingerprint>,
+    diagnostic_entries: Vec<crate::features::diagnostics::DiagnosticEntry>,
+}
+
+/// Program roots available to one compiler semantic collection pass.
+#[derive(Debug, Clone)]
+struct ProgramRoots {
+    /// Package root for the snapshot's owning package, absent for loose files.
+    current: Option<Arc<PathBuf>>,
+    /// Source dependency roots keyed by both full import and leaf symbols.
+    source_dependencies: Arc<HashMap<Symbol, Arc<PathBuf>>>,
+    /// Shared virtual root for bytecode/network-only programs.
+    network_sentinel: Arc<PathBuf>,
+    /// Shared virtual root for standard-library identities.
+    library_sentinel: Arc<PathBuf>,
+}
+
+impl ProgramRoots {
+    /// Build roots for the current package plus every imported stub identity.
+    fn for_package(
+        current: Arc<PathBuf>,
+        dependency_roots: Arc<HashMap<Symbol, Arc<PathBuf>>>,
+        import_stubs: &IndexMap<Symbol, leo_ast::Stub>,
+        network_sentinel: Arc<PathBuf>,
+        library_sentinel: Arc<PathBuf>,
+    ) -> Self {
+        let mut source_dependencies = dependency_roots.as_ref().clone();
+        for (import_name, stub) in import_stubs {
+            let root = match stub {
+                Stub::FromLeo { .. } => source_dependencies.get(import_name).cloned(),
+                Stub::FromAleo { .. } => Some(Arc::clone(&network_sentinel)),
+                Stub::FromLibrary { .. } => Some(Arc::clone(&library_sentinel)),
+            };
+            if let Some(root) = root {
+                insert_stub_root_aliases(&mut source_dependencies, *import_name, stub, root);
+            }
+        }
+
+        Self {
+            current: Some(current),
+            source_dependencies: Arc::new(source_dependencies),
+            network_sentinel,
+            library_sentinel,
+        }
+    }
+
+    /// Return the root that makes a program identity stable.
+    fn root_for_symbol(&self, symbol: Symbol) -> Option<Arc<PathBuf>> {
+        self.source_dependencies.get(&symbol).cloned()
+    }
+
+    /// Return a virtual root for a compiler stub with no source package.
+    fn root_for_stub(&self, stub: &Stub) -> Option<Arc<PathBuf>> {
+        match stub {
+            Stub::FromLeo { .. } => None,
+            Stub::FromAleo { .. } => Some(Arc::clone(&self.network_sentinel)),
+            Stub::FromLibrary { .. } => Some(Arc::clone(&self.library_sentinel)),
+        }
+    }
 }
 
 /// Build the latest package analysis plus the trigger document's token view.
@@ -194,8 +275,8 @@ struct CompilerOutput {
 /// Syntax analysis always runs first so the server can return a best-effort
 /// token stream even when package discovery, dependency loading, or compiler
 /// analysis fail. Compiler-backed occurrences then replace matching syntax
-/// ranges when available so navigation reuses the same semantic truth as
-/// highlighting.
+/// ranges when available, and any buffered diagnostics from the same compiler
+/// pass are threaded through to the cached package result.
 pub fn analyze_package_snapshot(
     snapshot: &DocumentSnapshot,
     package_cache: &mut PackageAnalysisCache,
@@ -208,6 +289,7 @@ pub fn analyze_package_snapshot(
             syntax.tokens,
             SemanticSource::SyntaxOnly,
             HashMap::new(),
+            Vec::new(),
         );
     }
 
@@ -219,11 +301,12 @@ pub fn analyze_package_snapshot(
             syntax.tokens,
             SemanticSource::SyntaxOnly,
             HashMap::new(),
+            Vec::new(),
         );
     }
 
-    let (occurrences, lexical_tokens, source, fingerprints) = match compiler_occurrences {
-        Some(CompilerOutput { occurrences, fingerprints }) => {
+    let (occurrences, lexical_tokens, source, fingerprints, diagnostic_entries) = match compiler_occurrences {
+        Some(CompilerOutput { occurrences: Some(occurrences), fingerprints, diagnostic_entries }) => {
             let mut merged_fingerprints = syntax.fingerprints;
             merged_fingerprints.extend(fingerprints);
             (
@@ -231,15 +314,28 @@ pub fn analyze_package_snapshot(
                 syntax.tokens,
                 SemanticSource::CompilerEnhanced,
                 merged_fingerprints,
+                diagnostic_entries,
             )
         }
-        None => {
+        Some(CompilerOutput { occurrences: None, diagnostic_entries, .. }) => {
+            // The compiler buffered diagnostics but did not produce usable
+            // AST occurrences (typical when the parser bailed). Use the
+            // package-fallback syntax tokens — they cover the full module
+            // listing — and still publish the buffered diagnostics so users
+            // see the parse error.
             let syntax = syntax_semantics::collect_package_fallback(snapshot);
-            (syntax.occurrences, syntax.tokens, SemanticSource::SyntaxOnly, syntax.fingerprints)
+            (syntax.occurrences, syntax.tokens, SemanticSource::SyntaxOnly, syntax.fingerprints, diagnostic_entries)
+        }
+        None => {
+            // Compiler analysis declined to run at all (no usable file
+            // source). Fall back to syntax tokens with no diagnostics;
+            // "compiler unavailable" is not a user-facing condition.
+            let syntax = syntax_semantics::collect_package_fallback(snapshot);
+            (syntax.occurrences, syntax.tokens, SemanticSource::SyntaxOnly, syntax.fingerprints, Vec::new())
         }
     };
 
-    package_analysis(snapshot, occurrences, lexical_tokens, source, fingerprints)
+    package_analysis(snapshot, occurrences, lexical_tokens, source, fingerprints, diagnostic_entries)
 }
 
 /// Compatibility helper retained for PR 2 tests and callers.
@@ -266,14 +362,19 @@ pub fn build_document_view(snapshot: &DocumentViewSnapshot, package: Arc<CachedP
     CachedDocumentView { key: snapshot.key.clone(), encoded_tokens }
 }
 
-/// Lower merged occurrences into a shared package index and trigger-document view.
+/// Lower merged occurrences and lowered diagnostic entries into a shared
+/// package index, document view, and immutable diagnostic set.
 fn package_analysis(
     snapshot: &DocumentSnapshot,
-    occurrences: Vec<SymbolOccurrence>,
+    mut occurrences: Vec<SymbolOccurrence>,
     lexical_tokens: Vec<SemanticTokenOccurrence>,
     source: SemanticSource,
     recorded_fingerprints: HashMap<PathBuf, SourceFingerprint>,
+    diagnostic_entries: Vec<crate::features::diagnostics::DiagnosticEntry>,
 ) -> PackageWorkerAnalysis {
+    let package_source_files = PackageSourceFiles::from_snapshot(snapshot);
+    retain_in_scope_occurrences(&mut occurrences, &package_source_files);
+
     let (index, analyzed_files) = SemanticIndex::build(
         &occurrences,
         |path| {
@@ -284,13 +385,19 @@ fn package_analysis(
                 .unwrap_or(SourceFingerprint::Volatile)
         },
         |path| open_line_index(snapshot.open_overlays.as_ref(), path),
+        |path| package_source_files.contains(path),
     );
     let index = Arc::new(index);
+    let diagnostics = Arc::new(crate::features::diagnostics::DiagnosticSet {
+        key: snapshot.package_key.clone(),
+        entries: Arc::from(crate::features::diagnostics::finalize_entries(diagnostic_entries)),
+    });
     let package = Arc::new(CachedPackageAnalysis {
         key: snapshot.package_key.clone(),
         index: Arc::clone(&index),
         analyzed_files: Arc::new(analyzed_files),
         source,
+        diagnostics,
     });
 
     let package_tokens =
@@ -300,6 +407,50 @@ fn package_analysis(
     let document_view = CachedDocumentView { key: snapshot.view_key.clone(), encoded_tokens };
 
     PackageWorkerAnalysis { package, document_view }
+}
+
+/// Canonical package source membership used to trim dependency-stub noise.
+#[derive(Debug, Clone)]
+pub(crate) struct PackageSourceFiles {
+    source_directory: Option<Arc<PathBuf>>,
+    paths: Box<[Arc<PathBuf>]>,
+}
+
+impl PackageSourceFiles {
+    /// Capture the source paths that belong to the current package snapshot.
+    fn from_snapshot(snapshot: &DocumentSnapshot) -> Self {
+        let source_directory = snapshot.project.as_ref().map(|project| Arc::clone(&project.source_directory));
+        let mut paths = Vec::<Arc<PathBuf>>::new();
+        if let Some(file_path) = snapshot.file_path.as_ref() {
+            paths.push(Arc::clone(file_path));
+        }
+        for overlay in snapshot.open_overlays.iter() {
+            paths.push(Arc::clone(&overlay.path));
+        }
+        paths.sort_by(|left, right| left.as_path().cmp(right.as_path()));
+        paths.dedup_by(|left, right| left.as_path() == right.as_path());
+        Self { source_directory, paths: paths.into_boxed_slice() }
+    }
+
+    /// Return whether a path belongs to the package being actively edited.
+    pub(crate) fn contains(&self, path: &StdPath) -> bool {
+        if self.source_directory.as_ref().is_some_and(|source_directory| path.starts_with(source_directory.as_ref())) {
+            return true;
+        }
+        self.paths.binary_search_by(|candidate| candidate.as_path().cmp(path)).is_ok()
+    }
+}
+
+/// Drop dependency-stub noise while retaining declarations and keyed references.
+pub(crate) fn retain_in_scope_occurrences(
+    occurrences: &mut Vec<SymbolOccurrence>,
+    package_source_files: &PackageSourceFiles,
+) {
+    occurrences.retain(|occurrence| {
+        package_source_files.contains(occurrence.range.path.as_ref())
+            || occurrence.role == OccurrenceRole::Declaration
+            || occurrence.identity.key().is_some()
+    });
 }
 
 /// Merge symbol occurrences with highlighting-only lexical tokens for encoding.
@@ -322,8 +473,9 @@ fn semantic_token_occurrences(
 
 /// Try to refine syntax occurrences with compiler frontend analysis.
 ///
-/// Failures stay local to this helper so callers can fall back to syntax-only
-/// highlighting without treating compiler analysis as fatal.
+/// Dependency-stub failures and handler-buffered errors both flow back as
+/// `CompilerOutput` so the caller can publish them as diagnostics even when
+/// no AST was produced.
 fn compiler_occurrences(
     snapshot: &DocumentSnapshot,
     package_cache: &mut PackageAnalysisCache,
@@ -334,59 +486,92 @@ fn compiler_occurrences(
 
     let input = compiler_input(snapshot)?;
 
+    let trigger_path = snapshot.file_path.clone();
     let result = create_session_if_not_set_then(|_| {
         // Dependency resolution and parsing intern symbols, so the worker must
         // enter a Leo session before it asks the compiler for frontend state.
         let file_source = RecordingFileSource::new(Arc::clone(&snapshot.open_overlays));
         match input {
             CompilerInput::ManagedPackage { project } => {
-                let import_stubs = package_cache.import_stubs_for(project.as_ref(), &file_source).map_err(|error| {
-                    tracing::debug!(
-                        package = project.package_root.display().to_string(),
-                        error,
-                        "dependency stub loading failed"
-                    );
-                    error
-                })?;
+                let import_stubs = match package_cache.import_stubs_for(project.as_ref(), &file_source) {
+                    Ok(import_stubs) => import_stubs,
+                    Err(error) => {
+                        tracing::debug!(
+                            package = project.package_root.display().to_string(),
+                            error = error.as_str(),
+                            "dependency stub loading failed"
+                        );
+                        // Surface stub-loading errors as a synthetic
+                        // package-level diagnostic. Falling back to syntax-only
+                        // analysis is still useful, but the user needs to see
+                        // why their import graph cannot be resolved.
+                        let synthetic = vec![dependency_load_error(&error)];
+                        let diagnostic_entries = lower_compiler_diagnostics(&synthetic, &[], trigger_path.as_ref());
+                        return Ok::<_, String>(CompilerOutput {
+                            occurrences: None,
+                            fingerprints: file_source.fingerprints_with(&[]),
+                            diagnostic_entries,
+                        });
+                    }
+                };
+                let program_roots = ProgramRoots::for_package(
+                    Arc::clone(&project.package_root),
+                    Arc::clone(&import_stubs.dependency_roots),
+                    import_stubs.import_stubs.as_ref(),
+                    Arc::clone(&package_cache.network_sentinel),
+                    Arc::clone(&package_cache.library_sentinel),
+                );
 
                 // Run the compiler against every open same-package editor
                 // buffer while recording fingerprints for disk files at the
                 // exact read boundary.
-                let output = run_compiler_analysis(
+                let outcome = run_compiler_analysis(
                     Some(project.program_name.to_string()),
                     project.entry_file.as_ref(),
                     project.source_directory.as_ref(),
                     &file_source,
                     import_stubs.import_stubs.as_ref().clone(),
+                    program_roots,
                     || check_snapshot_current(snapshot),
-                )
-                .map_err(|error| error.to_string())?;
+                );
 
+                let diagnostic_entries =
+                    lower_compiler_diagnostics(&outcome.errors, &outcome.warnings, trigger_path.as_ref());
                 check_snapshot_current(snapshot).map_err(|error| error.to_string())?;
                 Ok::<_, String>(CompilerOutput {
-                    occurrences: output,
+                    occurrences: outcome.occurrences,
                     fingerprints: file_source.fingerprints_with(import_stubs.fingerprints.as_ref()),
+                    diagnostic_entries,
                 })
             }
             CompilerInput::StandaloneProgram { file_path, source_directory } => {
                 let single_file_source = SingleFileSource::new(&file_source);
+                let program_roots = ProgramRoots {
+                    current: None,
+                    source_dependencies: Arc::new(HashMap::new()),
+                    network_sentinel: Arc::clone(&package_cache.network_sentinel),
+                    library_sentinel: Arc::clone(&package_cache.library_sentinel),
+                };
                 // Loose editor buffers should be analyzed as exactly one file.
                 // Scanning the parent directory would accidentally treat
                 // formatter fixtures or unrelated scratch files as Leo modules.
-                let output = run_compiler_analysis(
+                let outcome = run_compiler_analysis(
                     None,
                     file_path.as_ref(),
                     source_directory.as_ref(),
                     &single_file_source,
                     IndexMap::new(),
+                    program_roots,
                     || check_snapshot_current(snapshot),
-                )
-                .map_err(|error| error.to_string())?;
+                );
 
+                let diagnostic_entries =
+                    lower_compiler_diagnostics(&outcome.errors, &outcome.warnings, trigger_path.as_ref());
                 check_snapshot_current(snapshot).map_err(|error| error.to_string())?;
                 Ok::<_, String>(CompilerOutput {
-                    occurrences: output,
+                    occurrences: outcome.occurrences,
                     fingerprints: file_source.fingerprints_with(&[]),
+                    diagnostic_entries,
                 })
             }
         }
@@ -399,6 +584,35 @@ fn compiler_occurrences(
             None
         }
     }
+}
+
+/// Wrap a dependency-stub load failure as a `Backtraced` error so it lowers
+/// into a synthetic diagnostic on the saved trigger document.
+fn dependency_load_error(message: &str) -> leo_errors::LeoError {
+    leo_errors::Backtraced::new_from_backtrace(
+        format!("Leo dependency analysis failed: {message}"),
+        None,
+        0,
+        "LSP".to_owned(),
+        true,
+        leo_errors::Backtrace::new(),
+    )
+    .into()
+}
+
+/// Lower buffered compiler errors and warnings into LSP-ready entries.
+///
+/// Must run inside `create_session_if_not_set_then` because span resolution
+/// reads the source map through `with_session_globals`.
+fn lower_compiler_diagnostics(
+    errors: &[leo_errors::LeoError],
+    warnings: &[leo_errors::LeoWarning],
+    trigger_path: Option<&Arc<PathBuf>>,
+) -> Vec<crate::features::diagnostics::DiagnosticEntry> {
+    let mut diagnostics: Vec<CompilerDiagnostic<'_>> = Vec::with_capacity(errors.len() + warnings.len());
+    diagnostics.extend(errors.iter().map(CompilerDiagnostic::Error));
+    diagnostics.extend(warnings.iter().map(CompilerDiagnostic::Warning));
+    crate::features::diagnostics::lower_diagnostic_entries(trigger_path, diagnostics)
 }
 
 /// Compiler frontend input shape selected for a document snapshot.
@@ -424,19 +638,37 @@ fn compiler_input(snapshot: &DocumentSnapshot) -> Option<CompilerInput> {
     })
 }
 
-/// Run frontend analysis and immediately collect semantic occurrences.
+/// Result of running the compiler frontend for one LSP analysis pass.
+///
+/// `occurrences` is `None` when analysis failed before the AST walker ran;
+/// `errors` and `warnings` may still be populated in that case.
+struct CompilerAnalysisOutcome {
+    occurrences: Option<Vec<SymbolOccurrence>>,
+    errors: Vec<leo_errors::LeoError>,
+    warnings: Vec<leo_errors::LeoWarning>,
+}
+
+/// Run frontend analysis with a buffered handler and capture both semantic
+/// occurrences and diagnostics.
+///
+/// After the frontend runs we drain both buffers and merge in any
+/// final `LeoError` that the analysis call returned, taking care to drop the
+/// `LastErrorCode` sentinel because the real diagnostic has already been
+/// emitted through the handler.
 fn run_compiler_analysis(
     expected_unit_name: Option<String>,
     entry_file: &StdPath,
     source_directory: &StdPath,
     file_source: &impl FileSource,
     import_stubs: IndexMap<Symbol, leo_ast::Stub>,
+    program_roots: ProgramRoots,
     mut should_continue: impl FnMut() -> leo_errors::Result<()>,
-) -> leo_errors::Result<Vec<SymbolOccurrence>> {
+) -> CompilerAnalysisOutcome {
+    let (handler, emitter) = Handler::new_with_buf();
     let mut compiler = Compiler::new(
         expected_unit_name,
         false,
-        Handler::default(),
+        handler,
         Rc::new(leo_ast::NodeBuilder::default()),
         PathBuf::default(),
         Some(leo_compiler::CompilerOptions::default()),
@@ -444,15 +676,39 @@ fn run_compiler_analysis(
         leo_ast::NetworkName::TestnetV0,
     );
 
-    let frontend = compiler.analyze_frontend_from_directory_with_file_source_and_check(
+    let frontend_result = compiler.analyze_frontend_from_directory_with_file_source_and_check(
         entry_file,
         source_directory,
         file_source,
         &mut should_continue,
-    )?;
+    );
 
-    let FrontendAnalysis { ast, symbol_table, type_table } = frontend;
-    Ok(CompilerSemanticCollector::new(symbol_table, type_table).collect(ast))
+    // Collect AST-derived occurrences when the frontend ran to completion;
+    // diagnostics flow through the handler regardless.
+    let mut returned_error: Option<leo_errors::LeoError> = None;
+    let occurrences = match frontend_result {
+        Ok(FrontendAnalysis { ast, symbol_table, type_table }) => {
+            Some(CompilerSemanticCollector::new(symbol_table, type_table, program_roots).collect(ast))
+        }
+        Err(error) => {
+            returned_error = Some(error);
+            None
+        }
+    };
+
+    let mut errors = emitter.extract_errs().into_inner();
+    let warnings = emitter.extract_warnings().into_inner();
+    if let Some(returned) = returned_error
+        && !returned.is_last_error_code()
+    {
+        // `LastErrorCode` is the handler's way of saying "I already buffered
+        // the real diagnostic," so we drop it here to avoid double-publishing
+        // the same error. Any other `LeoError` represents a failure path the
+        // frontend never had a chance to push through the handler — keep it.
+        errors.push(returned);
+    }
+
+    CompilerAnalysisOutcome { occurrences, errors, warnings }
 }
 
 /// File source that serves all open same-package buffers and records read fingerprints.
@@ -601,9 +857,7 @@ fn open_line_index(overlays: &[OpenFileOverlay], path: &StdPath) -> Option<Arc<l
 
 /// Hash source text for stale-target detection without retaining full text.
 fn content_hash(contents: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    contents.hash(&mut hasher);
-    hasher.finish()
+    hash_text(contents)
 }
 
 impl PackageAnalysisCache {
@@ -629,8 +883,9 @@ impl PackageAnalysisCache {
         {
             let import_stubs = Arc::clone(&entry.import_stubs);
             let fingerprints = Arc::clone(&entry.fingerprints);
+            let dependency_roots = Arc::clone(&entry.dependency_roots);
             self.touch_entry(project.package_root.as_ref());
-            return Ok(CachedImportStubs { import_stubs, fingerprints });
+            return Ok(CachedImportStubs { import_stubs, fingerprints, dependency_roots });
         }
 
         // Import stubs are package-wide, but they depend on manifest/source
@@ -645,22 +900,24 @@ impl PackageAnalysisCache {
         let mut watch_state = HashMap::new();
         let revision = watched_paths_revision_cached(watch_paths.as_ref(), &mut watch_state);
         let import_stubs = Arc::new(loaded.stubs);
+        let dependency_roots = dependency_roots_from_stubs(import_stubs.as_ref());
         // Capturing dependency fingerprints here is what lets source-dependency
-        // go-to-definition return real disk locations on cache hits. Without
-        // carrying these fingerprints alongside the stubs, dependency targets
-        // would later look volatile and be filtered out as unsafe.
+        // navigation return real disk locations on cache hits. Without carrying
+        // these fingerprints alongside the stubs, dependency definition and
+        // reference targets would later look volatile and be filtered out.
         let fingerprints = file_source.dependency_fingerprints();
         let package_root = project.package_root.as_ref().clone();
         self.entries.insert(package_root.clone(), PackageAnalysisCacheEntry {
             import_stubs: Arc::clone(&import_stubs),
             fingerprints: Arc::clone(&fingerprints),
+            dependency_roots: Arc::clone(&dependency_roots),
             watch_paths,
             watch_state,
             revision,
         });
         self.touch_entry(&package_root);
         self.evict_old_entries(&package_root);
-        Ok(CachedImportStubs { import_stubs, fingerprints })
+        Ok(CachedImportStubs { import_stubs, fingerprints, dependency_roots })
     }
 
     /// Mark a package-root cache entry as most recently used.
@@ -687,6 +944,71 @@ impl PackageAnalysisCache {
     }
 }
 
+/// Recover source dependency roots from stub declaration spans without widening compiler APIs.
+fn dependency_roots_from_stubs(stubs: &IndexMap<Symbol, Stub>) -> Arc<HashMap<Symbol, Arc<PathBuf>>> {
+    let mut roots = HashMap::new();
+    for (import_name, stub) in stubs {
+        match stub {
+            Stub::FromLeo { program, .. } => {
+                let Some(root) = stub_program_declaration_range(stub)
+                    .and_then(|range| package_root_for_source(range.path.as_ref()))
+                    .map(Arc::new)
+                else {
+                    continue;
+                };
+                insert_program_root_aliases(&mut roots, *import_name, Arc::clone(&root));
+                for scope in program.program_scopes.values() {
+                    insert_program_root_aliases(&mut roots, scope.program_id.as_symbol(), Arc::clone(&root));
+                    insert_program_root_aliases(&mut roots, scope.program_id.name.name, Arc::clone(&root));
+                }
+            }
+            Stub::FromAleo { .. } | Stub::FromLibrary { .. } => {}
+        }
+    }
+    Arc::new(roots)
+}
+
+/// Insert both full and leaf symbols when they differ.
+fn insert_program_root_aliases(roots: &mut HashMap<Symbol, Arc<PathBuf>>, symbol: Symbol, root: Arc<PathBuf>) {
+    roots.entry(symbol).or_insert(root);
+}
+
+/// Insert every symbol spelling that can name an imported stub.
+fn insert_stub_root_aliases(
+    roots: &mut HashMap<Symbol, Arc<PathBuf>>,
+    import_name: Symbol,
+    stub: &Stub,
+    root: Arc<PathBuf>,
+) {
+    insert_program_root_aliases(roots, import_name, Arc::clone(&root));
+    match stub {
+        Stub::FromLeo { program, .. } => {
+            for scope in program.program_scopes.values() {
+                insert_program_root_aliases(roots, scope.program_id.as_symbol(), Arc::clone(&root));
+                insert_program_root_aliases(roots, scope.program_id.name.name, Arc::clone(&root));
+            }
+        }
+        Stub::FromAleo { program, .. } => {
+            insert_program_root_aliases(roots, program.stub_id.as_symbol(), Arc::clone(&root));
+            insert_program_root_aliases(roots, program.stub_id.name.name, root);
+        }
+        Stub::FromLibrary { library, .. } => {
+            insert_program_root_aliases(roots, library.name, root);
+        }
+    }
+}
+
+/// Find the nearest manifest root owning a source file.
+fn package_root_for_source(path: &StdPath) -> Option<PathBuf> {
+    for ancestor in path.parent()?.ancestors() {
+        let manifest = ancestor.join(leo_package::MANIFEST_FILENAME);
+        if manifest.is_file() {
+            return Some(ancestor.canonicalize().unwrap_or_else(|_| ancestor.to_path_buf()));
+        }
+    }
+    None
+}
+
 /// Lexically scoped binding metadata reused when later paths resolve locally.
 #[derive(Debug, Clone)]
 struct LocalBinding {
@@ -709,7 +1031,10 @@ struct CompilerSemanticCollector<'a> {
     #[allow(dead_code)]
     type_table: &'a TypeTable,
     occurrences: Vec<SymbolOccurrence>,
+    program_roots: ProgramRoots,
     current_program: Symbol,
+    current_program_root: Option<Arc<PathBuf>>,
+    stub_depth: usize,
     current_module: Vec<Symbol>,
     local_scopes: Vec<HashMap<Symbol, LocalBinding>>,
     owner_stack: Vec<Option<Location>>,
@@ -717,12 +1042,15 @@ struct CompilerSemanticCollector<'a> {
 
 impl<'a> CompilerSemanticCollector<'a> {
     /// Create a fresh collector bound to one compiler frontend snapshot.
-    fn new(symbol_table: &'a SymbolTable, type_table: &'a TypeTable) -> Self {
+    fn new(symbol_table: &'a SymbolTable, type_table: &'a TypeTable, program_roots: ProgramRoots) -> Self {
         Self {
             symbol_table,
             type_table,
             occurrences: Vec::new(),
+            current_program_root: program_roots.current.clone(),
+            program_roots,
             current_program: Symbol::intern(""),
+            stub_depth: 0,
             current_module: Vec::new(),
             local_scopes: Vec::new(),
             owner_stack: Vec::new(),
@@ -793,6 +1121,7 @@ impl<'a> CompilerSemanticCollector<'a> {
             identifier,
             role,
             matches!(role, OccurrenceRole::Declaration).then(|| span_to_file_range(identifier.span)).flatten(),
+            self.namespace_root(identifier.name, role),
         );
     }
 
@@ -802,16 +1131,27 @@ impl<'a> CompilerSemanticCollector<'a> {
         identifier: &Identifier,
         role: OccurrenceRole,
         declaration: Option<FileRange>,
+        package_root: Option<Arc<PathBuf>>,
     ) {
         if let Some(range) = span_to_file_range(identifier.span) {
             self.occurrences.push(SymbolOccurrence {
                 range,
-                identity: SymbolIdentity::Program { name: identifier.name, declaration },
+                identity: SymbolIdentity::Program { program: identifier.name, package_root, declaration },
                 role,
                 token_kind: SemanticKind::Namespace,
                 readonly: false,
             });
         }
+    }
+
+    /// Resolve a namespace identifier to a package root when the compiler made it stable.
+    fn namespace_root(&self, symbol: Symbol, role: OccurrenceRole) -> Option<Arc<PathBuf>> {
+        if role == OccurrenceRole::Declaration {
+            return self.current_program_root.clone();
+        }
+        self.program_roots
+            .root_for_symbol(symbol)
+            .or_else(|| (symbol == self.current_program).then(|| self.current_program_root.clone()).flatten())
     }
 
     /// Record a globally addressable declaration or reference.
@@ -913,18 +1253,52 @@ impl<'a> CompilerSemanticCollector<'a> {
             .get(&import.as_symbol())
             .or_else(|| program.stubs.get(&import.name.name))
             .and_then(stub_program_declaration_range);
-        self.add_namespace_occurrence_with_declaration(&import.name, OccurrenceRole::Reference, declaration);
+        let package_root = self
+            .program_roots
+            .root_for_symbol(import.as_symbol())
+            .or_else(|| self.program_roots.root_for_symbol(import.name.name))
+            .or_else(|| {
+                program
+                    .stubs
+                    .get(&import.as_symbol())
+                    .or_else(|| program.stubs.get(&import.name.name))
+                    .and_then(|stub| self.program_roots.root_for_stub(stub))
+            });
+        let import_name = import.name.name.to_string();
+        let range = identifier_range_from_span(import.span(), import_name.as_str())
+            .or_else(|| span_to_file_range(import.name.span));
+        if let Some(range) = range {
+            self.occurrences.push(SymbolOccurrence {
+                range,
+                identity: SymbolIdentity::Program { program: import.name.name, package_root, declaration },
+                role: OccurrenceRole::Reference,
+                token_kind: SemanticKind::Namespace,
+                readonly: false,
+            });
+        }
     }
 
     /// Resolve a global path through the compiler symbol tables and emit the
     /// most accurate semantic kind available for its target declaration.
     fn visit_global_path(&mut self, path: &Path) {
         if let Some(user_program) = path.user_program() {
-            self.add_namespace_occurrence(&user_program.name, OccurrenceRole::Reference);
+            let package_root = self
+                .program_roots
+                .root_for_symbol(user_program.as_symbol())
+                .or_else(|| self.program_roots.root_for_symbol(user_program.name.name));
+            self.add_namespace_occurrence_with_declaration(
+                &user_program.name,
+                OccurrenceRole::Reference,
+                None,
+                package_root,
+            );
         } else if let Some(first) = path.qualifier().first()
             && (self.symbol_table.is_library(first.name) || first.name == self.current_program)
         {
-            self.add_namespace_occurrence(first, OccurrenceRole::Reference);
+            let package_root = self.namespace_root(first.name, OccurrenceRole::Reference).or_else(|| {
+                self.symbol_table.is_library(first.name).then(|| Arc::clone(&self.program_roots.library_sentinel))
+            });
+            self.add_namespace_occurrence_with_declaration(first, OccurrenceRole::Reference, None, package_root);
         }
 
         let location =
@@ -1171,6 +1545,25 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         input.stubs.values().for_each(|stub| self.visit_stub(stub));
     }
 
+    /// Visit dependency stubs with the active program root set to the stub's identity.
+    fn visit_stub(&mut self, input: &Stub) {
+        let previous_root = self.current_program_root.clone();
+        self.stub_depth += 1;
+        match input {
+            Stub::FromLeo { program, .. } => self.visit_program(program),
+            Stub::FromAleo { program, .. } => {
+                self.current_program_root = Some(Arc::clone(&self.program_roots.network_sentinel));
+                self.visit_aleo_program(program);
+            }
+            Stub::FromLibrary { library, .. } => {
+                self.current_program_root = Some(Arc::clone(&self.program_roots.library_sentinel));
+                self.visit_library(library);
+            }
+        }
+        self.stub_depth -= 1;
+        self.current_program_root = previous_root;
+    }
+
     /// Visit a library root while preserving the surrounding module context.
     fn visit_library(&mut self, input: &leo_ast::Library) {
         // Libraries reuse the same collector machinery as programs, but their
@@ -1179,6 +1572,9 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         let previous_module = std::mem::take(&mut self.current_module);
 
         self.current_program = input.name;
+        if self.stub_depth > 0 {
+            self.current_program_root = Some(Arc::clone(&self.program_roots.library_sentinel));
+        }
         input.consts.iter().for_each(|(_, declaration)| self.visit_const(declaration));
         input.structs.iter().for_each(|(_, composite)| self.visit_composite(composite));
         input.functions.iter().for_each(|(_, function)| self.visit_function(function));
@@ -1193,9 +1589,18 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         // Reset the module path at each program scope so top-level locations do
         // not accidentally inherit a nested module qualifier.
         let previous_program = self.current_program;
+        let previous_root = self.current_program_root.clone();
         let previous_module = std::mem::take(&mut self.current_module);
 
         self.current_program = input.program_id.as_symbol();
+        self.current_program_root = if self.stub_depth == 0 {
+            self.program_roots.current.clone()
+        } else {
+            self.program_roots
+                .root_for_symbol(input.program_id.as_symbol())
+                .or_else(|| self.program_roots.root_for_symbol(input.program_id.name.name))
+                .or(previous_root.clone())
+        };
         self.add_namespace_occurrence(&input.program_id.name, OccurrenceRole::Declaration);
         input.parents.iter().for_each(|(_, parent)| self.visit_type(parent));
         input.consts.iter().for_each(|(_, declaration)| self.visit_const(declaration));
@@ -1209,6 +1614,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         }
 
         self.current_program = previous_program;
+        self.current_program_root = previous_root;
         self.current_module = previous_module;
     }
 
@@ -1501,12 +1907,39 @@ fn program_name_range_from_span(span: leo_span::Span, name: &str) -> Option<File
     })
 }
 
+/// Recover an identifier token from a larger source span.
+fn identifier_range_from_span(span: leo_span::Span, name: &str) -> Option<FileRange> {
+    if span.is_dummy() {
+        return None;
+    }
+
+    with_session_globals(|session| {
+        let source_file = session.source_map.find_source_file(span.lo)?;
+        if span.hi > source_file.absolute_end {
+            return None;
+        }
+        let FileName::Real(path) = &source_file.name else {
+            return None;
+        };
+
+        let span_text = source_file.contents_of_span(span);
+        let name_offset = find_identifier_in_text(span_text, name)?;
+        let start = source_file.relative_offset(span.lo).checked_add(u32::try_from(name_offset).ok()?)?;
+        let end = start.checked_add(u32::try_from(name.len()).ok()?)?;
+        FileRange::new(Arc::new(path.clone()), start, end)
+    })
+}
+
 /// Find the identifier token in a `program name.aleo` source slice.
 fn find_program_name_in_text(text: &str, name: &str) -> Option<usize> {
     let program_end = text.find("program")?.checked_add("program".len())?;
+    find_identifier_in_text(&text[program_end..], name).map(|relative| program_end + relative)
+}
+
+/// Find an identifier token by spelling while respecting identifier boundaries.
+fn find_identifier_in_text(text: &str, name: &str) -> Option<usize> {
     let bytes = text.as_bytes();
-    text[program_end..].match_indices(name).find_map(|(relative, _)| {
-        let start = program_end + relative;
+    text.match_indices(name).find_map(|(start, _)| {
         let end = start + name.len();
         let left_boundary = start == 0 || !is_identifier_byte(bytes[start - 1]);
         let right_boundary = end == bytes.len() || !is_identifier_byte(bytes[end]);
@@ -1677,7 +2110,15 @@ mod tests {
     use crate::{
         document_store::{DocumentSnapshot, DocumentStore},
         project_model::ProjectModel,
-        semantics::{OccurrenceRole, SemanticSource, SourceFingerprint},
+        semantics::{
+            FileRange,
+            OccurrenceRole,
+            SemanticKind,
+            SemanticSource,
+            SourceFingerprint,
+            SymbolIdentity,
+            SymbolOccurrence,
+        },
     };
     use leo_ast::NetworkName;
     use leo_compiler::load_import_stubs_for_package;
@@ -1797,6 +2238,7 @@ mod tests {
             cache.entries.insert(package_root.clone(), PackageAnalysisCacheEntry {
                 import_stubs: Arc::new(Default::default()),
                 fingerprints: Arc::from(Vec::<(PathBuf, SourceFingerprint)>::new()),
+                dependency_roots: Arc::new(std::collections::HashMap::new()),
                 watch_paths: Arc::from([]),
                 watch_state: Default::default(),
                 revision: index as u64,
@@ -1902,6 +2344,51 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    /// Verifies dependency stubs retain declarations and keyed occurrences but drop unkeyed references.
+    #[test]
+    fn retain_in_scope_occurrences_drops_unkeyed_stub_references() {
+        let local = Arc::new(PathBuf::from("/tmp/root/src/main.leo"));
+        let stub = Arc::new(PathBuf::from("/tmp/helper/src/main.leo"));
+        let declaration = FileRange::new(Arc::clone(&local), 1, 5).expect("declaration");
+        let mut occurrences = vec![
+            test_occurrence(&local, 1, 5, SymbolIdentity::Unknown),
+            test_occurrence(&stub, 1, 5, SymbolIdentity::Unknown),
+            test_occurrence(&stub, 8, 12, SymbolIdentity::Member {
+                owner: None,
+                name: leo_span::Symbol::new(1),
+                declaration: None,
+            }),
+            test_occurrence(&stub, 15, 19, SymbolIdentity::Local { declaration }),
+        ];
+        occurrences[1].role = OccurrenceRole::Declaration;
+        let source_files =
+            super::PackageSourceFiles { source_directory: None, paths: vec![Arc::clone(&local)].into_boxed_slice() };
+
+        super::retain_in_scope_occurrences(&mut occurrences, &source_files);
+
+        assert_eq!(occurrences.len(), 3);
+        assert_eq!(occurrences[0].range.path.as_ref(), local.as_ref());
+        assert_eq!(occurrences[1].range.path.as_ref(), stub.as_ref());
+        assert_eq!(occurrences[1].role, OccurrenceRole::Declaration);
+        assert!(occurrences[2].identity.key().is_some());
+        assert!(
+            !occurrences
+                .iter()
+                .any(|occurrence| matches!(occurrence.identity, SymbolIdentity::Member { owner: None, .. }))
+        );
+    }
+
+    /// Build a symbol occurrence for filter tests.
+    fn test_occurrence(path: &Arc<PathBuf>, start: u32, end: u32, identity: SymbolIdentity) -> SymbolOccurrence {
+        SymbolOccurrence {
+            range: FileRange::new(Arc::clone(path), start, end).expect("range"),
+            identity,
+            role: OccurrenceRole::Reference,
+            token_kind: SemanticKind::Variable,
+            readonly: false,
+        }
+    }
+
     /// Verifies top-level const references share the declaration identity.
     #[test]
     fn top_level_consts_share_global_identity_with_references() {
@@ -1928,9 +2415,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(occurrences.len(), 2);
         assert!(occurrences.iter().all(|occurrence| occurrence.key_id().is_some()));
-        assert!(occurrences.iter().any(|occurrence| occurrence.role == OccurrenceRole::Declaration));
-        assert!(occurrences.iter().any(|occurrence| occurrence.role == OccurrenceRole::Reference));
-        assert!(occurrences.iter().all(|occurrence| occurrence.key == occurrences[0].key));
+        assert!(occurrences.iter().any(|occurrence| occurrence.role() == OccurrenceRole::Declaration));
+        assert!(occurrences.iter().any(|occurrence| occurrence.role() == OccurrenceRole::Reference));
+        let key = occurrences[0].key_id();
+        assert!(occurrences.iter().all(|occurrence| occurrence.key_id() == key));
     }
 
     /// Verifies import names carry a dependency-source definition target.
@@ -1941,11 +2429,13 @@ mod tests {
         write_manifest(&helper_root, "helper.aleo", "null");
         let helper_source = "program helper.aleo {\n    fn double(x: u32) -> u32 { return x + x; }\n}\n";
         fs::write(helper_root.join("src").join("main.leo"), helper_source).expect("write helper source");
+        let helper_main_path = helper_root.join("src").join("main.leo").canonicalize().expect("canonical helper path");
+        let helper_root = helper_root.canonicalize().expect("canonical helper root");
 
         let root = tempdir.path().join("root");
         let dependencies = json!([{ "name": "helper.aleo", "location": "local", "path": helper_root }]).to_string();
         write_manifest(&root, "root.aleo", dependencies.as_str());
-        let source = "import helper.aleo;\n\nprogram root.aleo {\n    fn main() -> u32 { return 1u32; }\n}\n";
+        let source = "import helper.aleo;\n\nprogram root.aleo {\n    fn main() -> u32 { return helper.aleo::double(1u32); }\n}\n";
         fs::write(root.join("src").join("main.leo"), source).expect("write root source");
         let main_path = root.join("src").join("main.leo").canonicalize().expect("canonical main path");
 
@@ -1963,7 +2453,13 @@ mod tests {
             })
             .expect("helper import occurrence");
         let key = occurrence.key_id().expect("navigation-grade import key");
-        assert!(!semantic_snapshot.index.definitions_for(key).is_empty());
+        assert!(
+            semantic_snapshot
+                .index
+                .definitions_for(key)
+                .iter()
+                .any(|range| { semantic_snapshot.index.files[range.file as usize].as_ref() == &helper_main_path })
+        );
     }
 
     /// Verifies member references resolve through the composite owner.
@@ -2001,9 +2497,10 @@ mod tests {
         assert_eq!(x_occurrences.len(), 3);
 
         assert!(x_occurrences.iter().all(|occurrence| occurrence.key_id().is_some()));
-        assert!(x_occurrences.iter().all(|occurrence| occurrence.key == x_occurrences[0].key));
-        assert!(x_occurrences.iter().any(|occurrence| occurrence.role == OccurrenceRole::Declaration));
-        assert_eq!(x_occurrences.iter().filter(|occurrence| occurrence.role == OccurrenceRole::Reference).count(), 2);
+        let key = x_occurrences[0].key_id();
+        assert!(x_occurrences.iter().all(|occurrence| occurrence.key_id() == key));
+        assert!(x_occurrences.iter().any(|occurrence| occurrence.role() == OccurrenceRole::Declaration));
+        assert_eq!(x_occurrences.iter().filter(|occurrence| occurrence.role() == OccurrenceRole::Reference).count(), 2);
     }
 
     /// Verifies same-named interface prototypes stay owner-qualified.
@@ -2041,8 +2538,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(shared_occurrences.len(), 2);
-        assert!(shared_occurrences.iter().all(|occurrence| occurrence.role == OccurrenceRole::Declaration));
+        assert!(shared_occurrences.iter().all(|occurrence| occurrence.role() == OccurrenceRole::Declaration));
         assert!(shared_occurrences.iter().all(|occurrence| occurrence.key_id().is_some()));
-        assert_ne!(shared_occurrences[0].key, shared_occurrences[1].key);
+        assert_ne!(shared_occurrences[0].key_id(), shared_occurrences[1].key_id());
     }
 }

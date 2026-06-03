@@ -16,19 +16,39 @@
 
 #![allow(clippy::mutable_key_type)]
 
+//! Main `leo-lsp` protocol loop and routing-thread state.
+//!
+//! This module owns the initialized LSP lifecycle, open-document routing,
+//! request cancellation, worker completion handling, and response-pool
+//! handoffs. Feature modules answer semantic questions; this layer preserves
+//! freshness, ordering, and single-writer JSON-RPC response semantics.
+
 use crate::{
     document_store::{AnalysisBucket, DocumentStore, DocumentViewKey, PackageAnalysisKey},
     features::{
+        diagnostics::{DiagnosticClientCapabilitySnapshot, DiagnosticEntry, DiagnosticSet, entry_to_lsp_diagnostic},
         goto_definition::{
             DefinitionQuery,
-            position_to_offset,
             resolve as resolve_definition,
             response_value as definition_response_value,
         },
+        lsp_range::{byte_range_to_lsp_range, position_to_offset},
+        references::ReferenceQuery,
+        rename::{PrepareRenameQuery, RenameQuery, prepare_rename_target, validate_new_name},
         semantic_tokens::{capability as semantic_tokens_capability, empty_response_value, response_value},
     },
     panic_boundary::catch_unwind,
+    pending::{PendingFeature, PendingRequest, cancel_drained},
     project_model::{ProjectModel, uri_to_file_path},
+    response_pool::{
+        OpenSnapshot,
+        REQUEST_FAILED,
+        RenameResult,
+        ResponseCompletion,
+        ResponseJob,
+        ResponsePool,
+        ResponseResult,
+    },
     scheduler::{PackageAnalysis, Scheduler, WorkerEvent},
     semantics::{CachedDocumentView, CachedPackageAnalysis},
 };
@@ -36,29 +56,44 @@ use anyhow::{Context, Result};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response, ResponseError};
 use lsp_types::{
     CancelParams,
+    Diagnostic,
     DidChangeTextDocumentParams,
     DidCloseTextDocumentParams,
     DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams,
     GotoDefinitionParams,
     InitializeParams,
     InitializeResult,
     NumberOrString,
     OneOf,
+    PrepareRenameResponse,
+    PublishDiagnosticsParams,
+    Range,
+    ReferenceParams,
+    RenameOptions,
+    RenameParams,
+    SaveOptions,
     SemanticTokensParams,
     ServerCapabilities,
     ServerInfo,
     TextDocumentContentChangeEvent,
+    TextDocumentPositionParams,
     TextDocumentSyncCapability,
     TextDocumentSyncKind,
     TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions,
     Uri,
+    WorkDoneProgressOptions,
 };
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     process::ExitCode,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// JSON-RPC code for internal server errors.
@@ -76,20 +111,42 @@ const SHUTDOWN: &str = "shutdown";
 const DID_OPEN: &str = "textDocument/didOpen";
 /// LSP full-document change notification method.
 const DID_CHANGE: &str = "textDocument/didChange";
+/// LSP save-document notification method.
+const DID_SAVE: &str = "textDocument/didSave";
 /// LSP close-document notification method.
 const DID_CLOSE: &str = "textDocument/didClose";
+/// LSP push-diagnostics notification method.
+const PUBLISH_DIAGNOSTICS: &str = "textDocument/publishDiagnostics";
 /// LSP request-cancellation notification method.
 const CANCEL_REQUEST: &str = "$/cancelRequest";
 /// LSP semantic-token request method.
 const SEMANTIC_TOKENS_FULL: &str = "textDocument/semanticTokens/full";
 /// LSP go-to-definition request method.
 const TEXT_DOCUMENT_DEFINITION: &str = "textDocument/definition";
+/// LSP find-all-references request method.
+const TEXT_DOCUMENT_REFERENCES: &str = "textDocument/references";
+/// LSP rename request method.
+const TEXT_DOCUMENT_RENAME: &str = "textDocument/rename";
+/// LSP prepare-rename request method.
+const TEXT_DOCUMENT_PREPARE_RENAME: &str = "textDocument/prepareRename";
 /// Maximum package analyses retained on the routing thread.
 const MAX_PACKAGE_CACHE_ENTRIES: usize = 8;
 /// Maximum pending go-to-definition requests across all packages.
 const MAX_PENDING_DEFINITIONS: usize = 128;
 /// Maximum pending go-to-definition requests waiting on one package key.
 const MAX_PENDING_DEFINITIONS_PER_KEY: usize = 16;
+/// Maximum pending references requests across all packages.
+const MAX_PENDING_REFERENCES: usize = 128;
+/// Maximum pending references requests waiting on one package key.
+const MAX_PENDING_REFERENCES_PER_KEY: usize = 16;
+/// Maximum pending rename requests across all packages.
+const MAX_PENDING_RENAMES: usize = 128;
+/// Maximum pending rename requests waiting on one package key.
+const MAX_PENDING_RENAMES_PER_KEY: usize = 16;
+/// Maximum pending prepare-rename requests across all packages.
+const MAX_PENDING_PREPARE_RENAMES: usize = 128;
+/// Maximum pending prepare-rename requests waiting on one package key.
+const MAX_PENDING_PREPARE_RENAMES_PER_KEY: usize = 16;
 
 /// In-memory state for one running `leo-lsp` server instance.
 ///
@@ -105,11 +162,39 @@ struct ServerState {
     documents: DocumentStore,
     project_model: ProjectModel,
     scheduler: Scheduler,
+    response_pool: ResponsePool,
     analysis: AnalysisCaches,
     semantic_token_requests: SemanticTokenRequestState,
     definition_requests: DefinitionRequestState,
+    reference_requests: ReferencesRequestState,
+    rename_requests: RenameRequestState,
+    prepare_rename_requests: PrepareRenameRequestState,
+    /// Diagnostic publish bookkeeping that enforces the staleness invariant.
+    diagnostics: DiagnosticPublishState,
+    /// Snapshot of the client's diagnostic capabilities captured at initialize.
+    diagnostic_capabilities: DiagnosticClientCapabilitySnapshot,
     client_definition_link_support: bool,
     hooks: TestHooks,
+}
+
+/// Routing-thread bookkeeping for the diagnostics publish path.
+#[derive(Debug, Default)]
+struct DiagnosticPublishState {
+    /// Save-triggered publishes waiting on an in-flight worker job. At most
+    /// one pending publish per package key; later saves overwrite the trigger.
+    pending_by_package: HashMap<PackageAnalysisKey, PendingDiagnosticPublish>,
+    /// URIs currently published into each bucket; used to clear stale URIs
+    /// when a later publish drops one out of the visible set.
+    published_by_bucket: HashMap<AnalysisBucket, HashSet<Uri>>,
+    /// URIs marked diagnostics-untrusted by a malformed full-sync `didChange`.
+    /// While present, the URI cannot receive non-empty diagnostics.
+    untrusted_uris: HashSet<Uri>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingDiagnosticPublish {
+    /// URI that requested the save and receives any synthetic spanless entries.
+    trigger_uri: Uri,
 }
 
 /// Shared semantic analysis and encoded document views.
@@ -158,6 +243,68 @@ struct PendingDefinitionRequest {
     query: DefinitionQuery,
 }
 
+/// Pending references requests keyed by package analysis.
+#[derive(Debug, Default)]
+struct ReferencesRequestState {
+    /// Waiters and in-flight conversions grouped by package analysis.
+    pending_by_package: HashMap<PackageAnalysisKey, Vec<PendingReferencesRequest>>,
+    /// Reverse lookup used to cancel or complete a request by ID.
+    pending_owner: HashMap<RequestId, PackageAnalysisKey>,
+}
+
+/// One pending references request with cancellation state owned by routing.
+#[derive(Debug, Clone)]
+struct PendingReferencesRequest {
+    /// Original LSP request ID to answer when conversion completes.
+    id: RequestId,
+    /// Cursor and freshness state captured when the request arrived.
+    query: ReferenceQuery,
+    /// Cancellation flag observed by the response pool.
+    cancel: Arc<AtomicBool>,
+    /// Whether this request has already been handed to the response pool.
+    dispatched: bool,
+}
+
+/// Pending rename requests keyed by package analysis.
+#[derive(Debug, Default)]
+struct RenameRequestState {
+    /// Waiters and in-flight conversions grouped by package analysis.
+    pending_by_package: HashMap<PackageAnalysisKey, Vec<PendingRenameRequest>>,
+    /// Reverse lookup used to cancel or complete a request by ID.
+    pending_owner: HashMap<RequestId, PackageAnalysisKey>,
+}
+
+/// One pending rename request with cancellation state owned by routing.
+#[derive(Debug, Clone)]
+struct PendingRenameRequest {
+    /// Original LSP request ID to answer when conversion completes.
+    id: RequestId,
+    /// Cursor, view freshness, and validated new-name state.
+    query: RenameQuery,
+    /// Cancellation flag observed by the response pool.
+    cancel: Arc<AtomicBool>,
+    /// Whether this request has already been handed to the response pool.
+    dispatched: bool,
+}
+
+/// Pending prepare-rename requests keyed by package analysis.
+#[derive(Debug, Default)]
+struct PrepareRenameRequestState {
+    /// Waiters grouped by package analysis. Prepare-rename never enters the pool.
+    pending_by_package: HashMap<PackageAnalysisKey, Vec<PendingPrepareRenameRequest>>,
+    /// Reverse lookup used to cancel a request by ID.
+    pending_owner: HashMap<RequestId, PackageAnalysisKey>,
+}
+
+/// One pending prepare-rename request, answered synchronously on cache hit.
+#[derive(Debug, Clone)]
+struct PendingPrepareRenameRequest {
+    /// Original LSP request ID to answer when analysis arrives.
+    id: RequestId,
+    /// Cursor and view freshness captured when the request arrived.
+    query: PrepareRenameQuery,
+}
+
 /// Run the production LSP server with hooks loaded from the process environment.
 pub(crate) fn run(connection: Connection) -> Result<ExitCode> {
     run_with_hooks(connection, TestHooks::from_env())
@@ -170,6 +317,7 @@ fn run_with_hooks(connection: Connection, hooks: TestHooks) -> Result<ExitCode> 
         serde_json::from_value(params).context("failed to deserialize initialize params")?;
     let workspace_roots = collect_workspace_roots(&initialize_params);
     let client_definition_link_support = client_supports_definition_links(&initialize_params);
+    let diagnostic_capabilities = DiagnosticClientCapabilitySnapshot::from_initialize(&initialize_params);
 
     // Finish the initialize handshake before any main-loop state exists so the
     // steady-state server only has to reason about post-initialize traffic.
@@ -190,9 +338,15 @@ fn run_with_hooks(connection: Connection, hooks: TestHooks) -> Result<ExitCode> 
         documents: DocumentStore::default(),
         project_model: ProjectModel::default(),
         scheduler: Scheduler::new(hooks.panic_on_worker_job),
+        response_pool: ResponsePool::new(),
         analysis: AnalysisCaches::default(),
         semantic_token_requests: SemanticTokenRequestState::default(),
         definition_requests: DefinitionRequestState::default(),
+        reference_requests: ReferencesRequestState::default(),
+        rename_requests: RenameRequestState::default(),
+        prepare_rename_requests: PrepareRenameRequestState::default(),
+        diagnostics: DiagnosticPublishState::default(),
+        diagnostic_capabilities,
         client_definition_link_support,
         hooks,
     };
@@ -217,10 +371,16 @@ fn run_with_hooks(connection: Connection, hooks: TestHooks) -> Result<ExitCode> 
                     state.handle_worker_event(&connection, event);
                 }
             }
+            recv(state.response_pool.completions()) -> completion => {
+                if let Ok(completion) = completion {
+                    state.handle_response_completion(&connection, completion);
+                }
+            }
         }
     }
 
     state.scheduler.shutdown();
+    state.response_pool.shutdown();
     Ok(state.exit_code.unwrap_or(ExitCode::from(1)))
 }
 
@@ -283,6 +443,21 @@ impl ServerState {
                     serde_json::from_value(params).context("failed to deserialize textDocument/definition")?;
                 self.handle_goto_definition(connection, request_id, params)
             }
+            TEXT_DOCUMENT_REFERENCES => {
+                let params: ReferenceParams =
+                    serde_json::from_value(params).context("failed to deserialize textDocument/references")?;
+                self.handle_references(connection, request_id, params)
+            }
+            TEXT_DOCUMENT_RENAME => {
+                let params: RenameParams =
+                    serde_json::from_value(params).context("failed to deserialize textDocument/rename")?;
+                self.handle_rename(connection, request_id, params)
+            }
+            TEXT_DOCUMENT_PREPARE_RENAME => {
+                let params: TextDocumentPositionParams =
+                    serde_json::from_value(params).context("failed to deserialize textDocument/prepareRename")?;
+                self.handle_prepare_rename(connection, request_id, params)
+            }
             _ => {
                 tracing::debug!(method, "request is not implemented");
                 send_error_response(connection, request_id, METHOD_NOT_FOUND, "method not found")
@@ -331,6 +506,12 @@ impl ServerState {
                 let params: DidChangeTextDocumentParams =
                     serde_json::from_value(notification.params).context("failed to deserialize didChange")?;
                 self.handle_did_change(connection, params);
+                Ok(false)
+            }
+            DID_SAVE => {
+                let params: DidSaveTextDocumentParams =
+                    serde_json::from_value(notification.params).context("failed to deserialize didSave")?;
+                self.handle_did_save(connection, params);
                 Ok(false)
             }
             DID_CLOSE => {
@@ -383,11 +564,29 @@ impl ServerState {
     }
 
     /// Commit a full-document change and refresh package ownership before analysis.
+    ///
+    /// Every observed edit clears previously published diagnostics for the
+    /// affected bucket in the same routing turn, so a stale worker completion
+    /// cannot restore old ranges. Malformed full-sync payloads additionally
+    /// flag the URI diagnostics-untrusted until trusted text is committed.
     fn handle_did_change(&mut self, connection: &Connection, params: DidChangeTextDocumentParams) {
         let DidChangeTextDocumentParams { text_document, content_changes } = params;
         let previous_bucket = self.documents.package_key(&text_document.uri).map(|key| key.bucket);
+        let incoming_version = text_document.version;
 
         let Some(text) = extract_full_sync_text(content_changes) else {
+            // Malformed payload: clear current diagnostics and mark the URI
+            // untrusted so a later save cannot reuse the cached analysis.
+            self.clear_diagnostics_for_did_change(
+                connection,
+                &text_document.uri,
+                incoming_version,
+                previous_bucket.as_ref(),
+                previous_bucket.as_ref(),
+            );
+            if previous_bucket.is_some() {
+                self.diagnostics.untrusted_uris.insert(text_document.uri.clone());
+            }
             return;
         };
         // Re-resolve package ownership on every committed edit so semantic
@@ -396,7 +595,7 @@ impl ServerState {
         let (file_path, project) = self.project_model.resolve_document_context(&text_document.uri);
 
         let Some(prepared) =
-            self.documents.prepare_full_change(&text_document.uri, text_document.version, text, file_path, project)
+            self.documents.prepare_full_change(&text_document.uri, incoming_version, text, file_path, project)
         else {
             tracing::debug!(uri = text_document.uri.as_str(), "ignoring didChange for unopened document");
             return;
@@ -405,6 +604,15 @@ impl ServerState {
         self.hooks.maybe_panic_notification(DID_CHANGE);
 
         let snapshot = self.documents.commit_change(prepared);
+        // Trusted text resets the diagnostics-untrusted flag.
+        self.diagnostics.untrusted_uris.remove(&text_document.uri);
+        self.clear_diagnostics_for_did_change(
+            connection,
+            &text_document.uri,
+            incoming_version,
+            previous_bucket.as_ref(),
+            Some(&snapshot.package_key.bucket),
+        );
         self.invalidate_bucket_for_new_snapshot(
             connection,
             previous_bucket.as_ref(),
@@ -416,11 +624,91 @@ impl ServerState {
         self.scheduler.enqueue_package(snapshot);
     }
 
+    /// Handle a `textDocument/didSave` by publishing or queuing diagnostics.
+    ///
+    /// Save is the only event that produces a non-empty publish. The handler
+    /// publishes immediately from the cached package result when available,
+    /// records a pending marker if analysis is still in flight, and
+    /// short-circuits if the URI is diagnostics-untrusted or the package
+    /// analysis has failed.
+    fn handle_did_save(&mut self, connection: &Connection, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let Some(document) = self.documents.open_document(&uri) else {
+            return;
+        };
+        if document.file_path.is_none() {
+            // Unmanaged buffers without a file path cannot resolve compiler
+            // spans to a real path, so we cannot reasonably publish anything
+            // beyond a clear.
+            self.clear_uri_only(connection, &uri);
+            return;
+        }
+        if self.diagnostics.untrusted_uris.contains(&uri) {
+            self.clear_uri_only(connection, &uri);
+            return;
+        }
+        let Some(package_key) = self.documents.package_key(&uri) else {
+            return;
+        };
+
+        self.hooks.maybe_panic_notification(DID_SAVE);
+
+        if self.analysis.failed_packages.contains(&package_key) {
+            // Analysis crashed; drop any visible diagnostics and bail.
+            self.clear_bucket(connection, &package_key.bucket, None);
+            self.diagnostics.pending_by_package.remove(&package_key);
+            return;
+        }
+
+        if let Some(package) = self.analysis.packages.get(&package_key).cloned() {
+            if self.package_freshness_ok(&package_key) {
+                self.diagnostics.pending_by_package.remove(&package_key);
+                self.publish_diagnostic_set(connection, &uri, package.diagnostics.as_ref());
+                return;
+            }
+            // The cached analysis exists but at least one open sibling has
+            // drifted; throw it away and enqueue a fresh analysis with a
+            // pending publish marker so the next completion satisfies the
+            // save.
+            self.analysis.invalidate_bucket(&package_key.bucket);
+            self.cancel_pending_bucket_requests(connection, &package_key.bucket, "package analysis was superseded");
+        }
+
+        self.diagnostics
+            .pending_by_package
+            .insert(package_key.clone(), PendingDiagnosticPublish { trigger_uri: uri.clone() });
+        self.ensure_package_analysis(&package_key, &uri);
+    }
+
+    /// Verify every open document in the bucket still resolves to the same package key.
+    ///
+    /// Cached package diagnostics may only be reused on `didSave` when every
+    /// open sibling in the bucket still claims the same package generation.
+    /// This catches the race where a sibling close/open changed the bucket
+    /// generation between the worker completion and the save.
+    fn package_freshness_ok(&self, key: &PackageAnalysisKey) -> bool {
+        let mut saw_any = false;
+        for (uri, document) in self.documents.iter_open() {
+            if document.analysis_bucket != key.bucket {
+                continue;
+            }
+            saw_any = true;
+            let Some(open_key) = self.documents.package_key(uri) else {
+                return false;
+            };
+            if &open_key != key {
+                return false;
+            }
+        }
+        saw_any
+    }
+
     /// Close a document and flush or cancel any waiters tied to its bucket.
     fn handle_did_close(&mut self, connection: &Connection, params: DidCloseTextDocumentParams) {
         self.hooks.maybe_panic_notification(DID_CLOSE);
         let uri = params.text_document.uri;
         let previous_bucket = self.documents.package_key(&uri).map(|key| key.bucket);
+        self.clear_diagnostics_for_did_close(connection, &uri);
         self.documents.close(&uri);
         self.scheduler.set_open_buckets(self.documents.open_buckets());
         if let Err(error) =
@@ -431,15 +719,40 @@ impl ServerState {
         if let Err(error) = send_definition_nulls(connection, self.definition_requests.clear_uri(&uri)) {
             tracing::error!(uri = uri.as_str(), error = %error, "failed to flush definition close responses");
         }
+        if let Err(error) = send_reference_nulls(connection, self.reference_requests.clear_uri(&uri)) {
+            tracing::error!(uri = uri.as_str(), error = %error, "failed to flush references close responses");
+        }
+        // Rename and prepare-rename reply with `RequestCanceled` on close
+        // because the user closing the document is backing out of the
+        // action, not the server stating "not renameable".
+        log_drain(
+            cancel_drained(
+                connection,
+                self.rename_requests.drain_uri(&uri),
+                ErrorCode::RequestCanceled as i32,
+                "rename request cancelled by close",
+            ),
+            "rename close waiters",
+        );
+        log_drain(
+            cancel_drained(
+                connection,
+                self.prepare_rename_requests.drain_uri(&uri),
+                ErrorCode::RequestCanceled as i32,
+                "prepare-rename request cancelled by close",
+            ),
+            "prepare-rename close waiters",
+        );
         if let Some(bucket) = previous_bucket {
             self.analysis.invalidate_bucket(&bucket);
             self.cancel_pending_bucket_requests(connection, &bucket, "package analysis was superseded");
+            self.diagnostics.pending_by_package.retain(|key, _| key.bucket != bucket);
         } else {
             self.analysis.invalidate_uri(&uri);
         }
     }
 
-    /// Remove a pending semantic-token or definition request by LSP request ID.
+    /// Remove a pending semantic-token, definition, or references request by LSP request ID.
     fn handle_cancel_request(&mut self, connection: &Connection, params: CancelParams) -> Result<()> {
         let request_id = request_id_from_cancel(params.id);
         if self.semantic_token_requests.remove_pending_request(&request_id) {
@@ -456,6 +769,24 @@ impl ServerState {
                 ErrorCode::RequestCanceled as i32,
                 "definition request cancelled",
             )
+        } else if let Some(pending) = self.reference_requests.remove_pending_request(&request_id) {
+            pending.cancel.store(true, Ordering::SeqCst);
+            send_error_response(
+                connection,
+                request_id,
+                ErrorCode::RequestCanceled as i32,
+                "references request cancelled",
+            )
+        } else if let Some(pending) = self.rename_requests.remove_pending_request(&request_id) {
+            pending.cancel.store(true, Ordering::SeqCst);
+            send_error_response(connection, request_id, ErrorCode::RequestCanceled as i32, "rename request cancelled")
+        } else if self.prepare_rename_requests.remove_pending_request(&request_id).is_some() {
+            send_error_response(
+                connection,
+                request_id,
+                ErrorCode::RequestCanceled as i32,
+                "prepare-rename request cancelled",
+            )
         } else {
             Ok(())
         }
@@ -469,10 +800,23 @@ impl ServerState {
                 if self.documents.generation(&uri) == Some(generation)
                     && self.documents.package_key(&uri) == Some(key.clone())
                 {
-                    self.analysis.store_package(Arc::clone(&result.package));
+                    for evicted in self.analysis.store_package(Arc::clone(&result.package)) {
+                        self.cancel_pending_package_requests(
+                            connection,
+                            &evicted,
+                            "package analysis was evicted from cache",
+                        );
+                        self.diagnostics.pending_by_package.remove(&evicted);
+                    }
                     self.store_document_view(connection, result.document_view);
                     self.answer_pending_definitions(connection, &key);
+                    self.answer_pending_references(&key);
+                    self.answer_pending_prepare_renames(connection, &key);
+                    self.answer_pending_renames(&key);
                     self.enqueue_pending_document_views_for_package(&key);
+                    // Diagnostics are published last so any pending save
+                    // marker observes the freshly cached package result.
+                    self.publish_pending_diagnostics(connection, &key);
                     tracing::debug!(
                         uri = uri.as_str(),
                         generation,
@@ -481,6 +825,7 @@ impl ServerState {
                     );
                 } else {
                     self.cancel_pending_package_requests(connection, &key, "package analysis was superseded");
+                    self.diagnostics.pending_by_package.remove(&key);
                     tracing::debug!(uri = uri.as_str(), generation, "dropping stale package worker completion");
                 }
             }
@@ -499,6 +844,7 @@ impl ServerState {
             WorkerEvent::PackageCancelled { key, uri, generation } => {
                 self.analysis.in_flight_packages.remove(&key);
                 self.cancel_pending_package_requests(connection, &key, "package analysis was cancelled");
+                self.diagnostics.pending_by_package.remove(&key);
                 tracing::debug!(uri = uri.as_str(), generation, "worker cancelled stale package analysis");
             }
             WorkerEvent::DocumentViewCancelled { key } => {
@@ -517,27 +863,19 @@ impl ServerState {
             WorkerEvent::PackagePanicked { key, uri, generation, report } => {
                 report.log();
                 self.analysis.in_flight_packages.remove(&key);
+                self.diagnostics.pending_by_package.remove(&key);
                 if self.documents.generation(&uri) == Some(generation)
                     && self.documents.package_key(&uri) == Some(key.clone())
                 {
                     self.analysis.store_failed_package(key.clone());
-                    let pending_semantic = self.semantic_token_requests.take_package(&key);
-                    if let Err(error) = send_error_responses(
+                    self.fail_pending_package_requests(
                         connection,
-                        pending_semantic,
-                        INTERNAL_ERROR,
-                        "semantic token analysis panicked; see server logs for details",
-                    ) {
-                        tracing::error!(uri = uri.as_str(), error = %error, "failed to send semantic analysis panic");
-                    }
-                    if let Err(error) = send_error_responses(
-                        connection,
-                        self.definition_requests.take_package(&key).into_iter().map(|pending| pending.id).collect(),
-                        INTERNAL_ERROR,
-                        "definition analysis panicked; see server logs for details",
-                    ) {
-                        tracing::error!(uri = uri.as_str(), error = %error, "failed to send definition analysis panic");
-                    }
+                        &key,
+                        "analysis panicked; see server logs for details",
+                    );
+                    // Drop visible diagnostics so the editor stops showing
+                    // stale errors after the analysis panicked.
+                    self.clear_bucket(connection, &key.bucket, None);
                 } else {
                     self.cancel_pending_package_requests(connection, &key, "package analysis was superseded");
                 }
@@ -561,6 +899,57 @@ impl ServerState {
                         &key,
                         "semantic token document view was superseded",
                     );
+                }
+            }
+        }
+    }
+
+    /// Forward a response-pool completion if the request is still live.
+    fn handle_response_completion(&mut self, connection: &Connection, completion: ResponseCompletion) {
+        match completion {
+            ResponseCompletion::References { id, key, cancel, result } => {
+                let Some(pending) = self.reference_requests.get(&id) else {
+                    return;
+                };
+                // JSON-RPC IDs can be reused after cancellation. The package
+                // key proves freshness for the analysis; the Arc identity
+                // proves this completion belongs to the same dispatched waiter,
+                // not an older request that happened to use the same ID.
+                if pending.query.view_key.package != key || !Arc::ptr_eq(&pending.cancel, &cancel) {
+                    return;
+                }
+                let Some(_pending) = self.reference_requests.remove_pending_request(&id) else {
+                    return;
+                };
+                let send_result = match result {
+                    ResponseResult::Ok(value) => send_ok_response(connection, id, value),
+                    ResponseResult::InternalError(message) => {
+                        send_error_response(connection, id, INTERNAL_ERROR, message)
+                    }
+                };
+                if let Err(error) = send_result {
+                    tracing::error!(error = %error, "failed to send references response");
+                }
+            }
+            ResponseCompletion::Rename { id, key, cancel, result } => {
+                let Some(pending) = self.rename_requests.get(&id) else {
+                    return;
+                };
+                if pending.query.view_key.package != key || !Arc::ptr_eq(&pending.cancel, &cancel) {
+                    return;
+                }
+                let Some(_pending) = self.rename_requests.remove_pending_request(&id) else {
+                    return;
+                };
+                let send_result = match result {
+                    RenameResult::Ok(value) => send_ok_response(connection, id, value),
+                    RenameResult::InternalError(message) => {
+                        send_error_response(connection, id, INTERNAL_ERROR, message)
+                    }
+                    RenameResult::RequestFailed { code, message } => send_error_response(connection, id, code, message),
+                };
+                if let Err(error) = send_result {
+                    tracing::error!(error = %error, "failed to send rename response");
                 }
             }
         }
@@ -660,6 +1049,174 @@ impl ServerState {
         }
     }
 
+    /// Answer or queue one find-all-references request.
+    fn handle_references(
+        &mut self,
+        connection: &Connection,
+        request_id: RequestId,
+        params: ReferenceParams,
+    ) -> Result<()> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let Some(document) = self.documents.open_document(&uri) else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+        if document.file_path.is_none() {
+            return send_ok_response(connection, request_id, Value::Null);
+        }
+        let Some(offset) = position_to_offset(document.line_index.as_ref(), position) else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+        let Some(view_key) = self.documents.document_view_key(&uri) else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+
+        if self.analysis.failed_packages.contains(&view_key.package) {
+            return send_error_response(
+                connection,
+                request_id,
+                INTERNAL_ERROR,
+                "references analysis panicked; see server logs for details",
+            );
+        }
+
+        let package = self.analysis.packages.get(&view_key.package).cloned();
+        let query = ReferenceQuery {
+            offset,
+            position,
+            view_key: view_key.clone(),
+            include_declaration: params.context.include_declaration,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let dispatched = package.is_some();
+        if !self.reference_requests.queue(query, request_id.clone(), Arc::clone(&cancel), dispatched) {
+            return send_error_response(
+                connection,
+                request_id,
+                ErrorCode::RequestCanceled as i32,
+                "too many pending references requests",
+            );
+        }
+
+        if let Some(package) = package {
+            self.dispatch_reference_job(request_id, view_key.package, package, cancel);
+        } else {
+            self.ensure_package_analysis(&view_key.package, &uri);
+        }
+        Ok(())
+    }
+
+    /// Answer or queue one prepare-rename request.
+    fn handle_prepare_rename(
+        &mut self,
+        connection: &Connection,
+        request_id: RequestId,
+        params: TextDocumentPositionParams,
+    ) -> Result<()> {
+        let uri = params.text_document.uri;
+        let position = params.position;
+        let Some(document) = self.documents.open_document(&uri) else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+        let Some(file_path) = document.file_path.clone() else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+        let Some(offset) = position_to_offset(document.line_index.as_ref(), position) else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+        let line_index = Arc::clone(&document.line_index);
+        let Some(view_key) = self.documents.document_view_key(&uri) else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+
+        if self.analysis.failed_packages.contains(&view_key.package) {
+            return send_error_response(
+                connection,
+                request_id,
+                INTERNAL_ERROR,
+                "prepare-rename analysis panicked; see server logs for details",
+            );
+        }
+
+        let query = PrepareRenameQuery { offset, position, view_key: view_key.clone() };
+
+        if let Some(package) = self.analysis.packages.get(&view_key.package).cloned() {
+            let value =
+                prepare_rename_response_value(&query, package.as_ref(), file_path.as_ref(), line_index.as_ref());
+            return send_ok_response(connection, request_id, value);
+        }
+
+        if !self.prepare_rename_requests.queue(query, request_id.clone()) {
+            return send_error_response(
+                connection,
+                request_id,
+                ErrorCode::RequestCanceled as i32,
+                "too many pending prepare-rename requests",
+            );
+        }
+        self.ensure_package_analysis(&view_key.package, &uri);
+        Ok(())
+    }
+
+    /// Answer or queue one rename request.
+    fn handle_rename(&mut self, connection: &Connection, request_id: RequestId, params: RenameParams) -> Result<()> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+
+        // Validate the new name synchronously before allocating any pending-state
+        // slot or pool resources. Statically unrenameable inputs reject inline.
+        if let Err(error) = validate_new_name(&new_name) {
+            let crate::features::rename::RenameError::InvalidIdentifier(message) = error else {
+                // validate_new_name only ever returns InvalidIdentifier.
+                unreachable!("validate_new_name returned non-identifier error");
+            };
+            return send_error_response(connection, request_id, REQUEST_FAILED, message);
+        }
+
+        let Some(document) = self.documents.open_document(&uri) else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+        if document.file_path.is_none() {
+            return send_ok_response(connection, request_id, Value::Null);
+        }
+        let Some(offset) = position_to_offset(document.line_index.as_ref(), position) else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+        let Some(view_key) = self.documents.document_view_key(&uri) else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+
+        if self.analysis.failed_packages.contains(&view_key.package) {
+            return send_error_response(
+                connection,
+                request_id,
+                INTERNAL_ERROR,
+                "rename analysis panicked; see server logs for details",
+            );
+        }
+
+        let package = self.analysis.packages.get(&view_key.package).cloned();
+        let query = RenameQuery { offset, position, view_key: view_key.clone(), new_name };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let dispatched = package.is_some();
+        if !self.rename_requests.queue(query, request_id.clone(), Arc::clone(&cancel), dispatched) {
+            return send_error_response(
+                connection,
+                request_id,
+                ErrorCode::RequestCanceled as i32,
+                "too many pending rename requests",
+            );
+        }
+
+        if let Some(package) = package {
+            self.dispatch_rename_job(request_id, view_key.package, package, cancel);
+        } else {
+            self.ensure_package_analysis(&view_key.package, &uri);
+        }
+        Ok(())
+    }
+
     /// Ensure the package and document-view analysis needed for a token request is queued.
     fn ensure_analysis_for_view(&mut self, view_key: &DocumentViewKey) {
         if let Some(package) = self.analysis.packages.get(&view_key.package).cloned() {
@@ -722,6 +1279,97 @@ impl ServerState {
         }
     }
 
+    /// Dispatch queued references requests unblocked by a cached package.
+    fn answer_pending_references(&mut self, key: &PackageAnalysisKey) {
+        let Some(package) = self.analysis.packages.get(key).cloned() else {
+            return;
+        };
+        for pending in self.reference_requests.mark_undispatched(key) {
+            self.dispatch_reference_job(pending.id, key.clone(), Arc::clone(&package), Arc::clone(&pending.cancel));
+        }
+    }
+
+    /// Hand one references request to the response pool.
+    fn dispatch_reference_job(
+        &self,
+        request_id: RequestId,
+        _key: PackageAnalysisKey,
+        package: Arc<CachedPackageAnalysis>,
+        cancel: Arc<AtomicBool>,
+    ) {
+        let Some(pending) = self.reference_requests.get(&request_id) else {
+            return;
+        };
+        self.response_pool.submit(ResponseJob::References {
+            id: request_id,
+            query: Box::new(pending.query.clone()),
+            package,
+            open_snapshot: OpenSnapshot::snapshot(&self.documents),
+            cancel,
+        });
+    }
+
+    /// Dispatch queued rename requests unblocked by a cached package.
+    fn answer_pending_renames(&mut self, key: &PackageAnalysisKey) {
+        let Some(package) = self.analysis.packages.get(key).cloned() else {
+            return;
+        };
+        for pending in self.rename_requests.mark_undispatched(key) {
+            self.dispatch_rename_job(pending.id, key.clone(), Arc::clone(&package), Arc::clone(&pending.cancel));
+        }
+    }
+
+    /// Resolve queued prepare-rename requests synchronously against a cached package.
+    fn answer_pending_prepare_renames(&mut self, connection: &Connection, key: &PackageAnalysisKey) {
+        let Some(package) = self.analysis.packages.get(key).cloned() else {
+            return;
+        };
+        for pending in self.prepare_rename_requests.take_package(key) {
+            let Some(document) = self.documents.open_document(&pending.query.view_key.uri) else {
+                if let Err(error) = send_ok_response(connection, pending.id, Value::Null) {
+                    tracing::error!(error = %error, "failed to send prepare-rename response");
+                }
+                continue;
+            };
+            let Some(file_path) = document.file_path.clone() else {
+                if let Err(error) = send_ok_response(connection, pending.id, Value::Null) {
+                    tracing::error!(error = %error, "failed to send prepare-rename response");
+                }
+                continue;
+            };
+            let line_index = Arc::clone(&document.line_index);
+            let value = prepare_rename_response_value(
+                &pending.query,
+                package.as_ref(),
+                file_path.as_ref(),
+                line_index.as_ref(),
+            );
+            if let Err(error) = send_ok_response(connection, pending.id, value) {
+                tracing::error!(error = %error, "failed to send prepare-rename response");
+            }
+        }
+    }
+
+    /// Hand one rename request to the response pool.
+    fn dispatch_rename_job(
+        &self,
+        request_id: RequestId,
+        _key: PackageAnalysisKey,
+        package: Arc<CachedPackageAnalysis>,
+        cancel: Arc<AtomicBool>,
+    ) {
+        let Some(pending) = self.rename_requests.get(&request_id) else {
+            return;
+        };
+        self.response_pool.submit(ResponseJob::Rename {
+            id: request_id,
+            query: Box::new(pending.query.clone()),
+            package,
+            open_snapshot: OpenSnapshot::snapshot(&self.documents),
+            cancel,
+        });
+    }
+
     /// Start document-view jobs unblocked by a newly cached package analysis.
     fn enqueue_pending_document_views_for_package(&mut self, key: &PackageAnalysisKey) {
         let Some(package) = self.analysis.packages.get(key).cloned() else {
@@ -734,6 +1382,10 @@ impl ServerState {
     }
 
     /// Invalidate stale analysis state when a document enters a new package snapshot.
+    ///
+    /// Diagnostic publishes pending against the affected buckets are dropped
+    /// here so a stale worker completion that arrives after the edit cannot
+    /// resurrect old diagnostic ranges.
     fn invalidate_bucket_for_new_snapshot(
         &mut self,
         connection: &Connection,
@@ -744,70 +1396,182 @@ impl ServerState {
         // Package analysis spans all open buffers in the bucket. Any committed
         // edit or bucket move invalidates package-level state, document views,
         // in-flight markers, and pending waiters that depended on old inputs.
+        let mut buckets: HashSet<AnalysisBucket> = HashSet::new();
         if let Some(previous_bucket) = previous_bucket
             && previous_bucket != current_bucket
         {
             self.analysis.invalidate_bucket(previous_bucket);
             self.cancel_pending_bucket_requests(connection, previous_bucket, message);
+            buckets.insert(previous_bucket.clone());
         }
         self.analysis.invalidate_bucket(current_bucket);
         self.cancel_pending_bucket_requests(connection, current_bucket, message);
+        buckets.insert(current_bucket.clone());
+        self.diagnostics.pending_by_package.retain(|key, _| !buckets.contains(&key.bucket));
     }
 
-    /// Cancel semantic-token and definition waiters tied to one analysis bucket.
+    /// Cancel every pending waiter tied to one analysis bucket.
+    ///
+    /// `cancel_drained` flips per-feature cancel flags before sending the
+    /// reply so an in-flight pool job whose bucket just bumped observes the
+    /// cancellation and drops its completion on arrival.
     fn cancel_pending_bucket_requests(
         &mut self,
         connection: &Connection,
         bucket: &AnalysisBucket,
         message: &'static str,
     ) {
-        if let Err(error) = send_error_responses(
-            connection,
-            self.semantic_token_requests.take_bucket(bucket),
-            ErrorCode::RequestCanceled as i32,
-            format!("semantic token {message}"),
-        ) {
-            tracing::error!(error = %error, "failed to cancel semantic token bucket waiters");
-        }
-
-        let definition_requests =
-            self.definition_requests.take_bucket(bucket).into_iter().map(|pending| pending.id).collect();
-        if let Err(error) = send_error_responses(
-            connection,
-            definition_requests,
-            ErrorCode::RequestCanceled as i32,
-            format!("definition {message}"),
-        ) {
-            tracing::error!(error = %error, "failed to cancel definition bucket waiters");
-        }
+        let code = ErrorCode::RequestCanceled as i32;
+        log_drain(
+            cancel_drained(
+                connection,
+                self.semantic_token_requests.drain_bucket(bucket),
+                code,
+                format!("semantic token {message}"),
+            ),
+            "semantic token bucket waiters",
+        );
+        log_drain(
+            cancel_drained(
+                connection,
+                self.definition_requests.drain_bucket(bucket),
+                code,
+                format!("definition {message}"),
+            ),
+            "definition bucket waiters",
+        );
+        log_drain(
+            cancel_drained(
+                connection,
+                self.reference_requests.drain_bucket(bucket),
+                code,
+                format!("references {message}"),
+            ),
+            "references bucket waiters",
+        );
+        log_drain(
+            cancel_drained(connection, self.rename_requests.drain_bucket(bucket), code, format!("rename {message}")),
+            "rename bucket waiters",
+        );
+        log_drain(
+            cancel_drained(
+                connection,
+                self.prepare_rename_requests.drain_bucket(bucket),
+                code,
+                format!("prepare-rename {message}"),
+            ),
+            "prepare-rename bucket waiters",
+        );
     }
 
-    /// Cancel semantic-token and definition waiters tied to one package key.
+    /// Fail every pending waiter tied to one package analysis key with `INTERNAL_ERROR`.
+    ///
+    /// Used by `PackagePanicked` for the still-current package key. Mirrors
+    /// the structure of `cancel_pending_package_requests` but maps to
+    /// `INTERNAL_ERROR` and a panic-shaped message per feature so the spec's
+    /// "shared drain helper... becomes load-bearing" goal is met for the
+    /// panic path too.
+    fn fail_pending_package_requests(
+        &mut self,
+        connection: &Connection,
+        key: &PackageAnalysisKey,
+        message: &'static str,
+    ) {
+        log_drain(
+            cancel_drained(
+                connection,
+                self.semantic_token_requests.drain_package(key),
+                INTERNAL_ERROR,
+                format!("semantic token {message}"),
+            ),
+            "semantic token panic waiters",
+        );
+        log_drain(
+            cancel_drained(
+                connection,
+                self.definition_requests.drain_package(key),
+                INTERNAL_ERROR,
+                format!("definition {message}"),
+            ),
+            "definition panic waiters",
+        );
+        log_drain(
+            cancel_drained(
+                connection,
+                self.reference_requests.drain_package(key),
+                INTERNAL_ERROR,
+                format!("references {message}"),
+            ),
+            "references panic waiters",
+        );
+        log_drain(
+            cancel_drained(
+                connection,
+                self.rename_requests.drain_package(key),
+                INTERNAL_ERROR,
+                format!("rename {message}"),
+            ),
+            "rename panic waiters",
+        );
+        log_drain(
+            cancel_drained(
+                connection,
+                self.prepare_rename_requests.drain_package(key),
+                INTERNAL_ERROR,
+                format!("prepare-rename {message}"),
+            ),
+            "prepare-rename panic waiters",
+        );
+    }
+
+    /// Cancel every pending waiter tied to one package analysis key.
     fn cancel_pending_package_requests(
         &mut self,
         connection: &Connection,
         key: &PackageAnalysisKey,
         message: &'static str,
     ) {
-        if let Err(error) = send_error_responses(
-            connection,
-            self.semantic_token_requests.take_package(key),
-            ErrorCode::RequestCanceled as i32,
-            format!("semantic token {message}"),
-        ) {
-            tracing::error!(error = %error, "failed to cancel semantic token package waiters");
-        }
-
-        let definition_requests =
-            self.definition_requests.take_package(key).into_iter().map(|pending| pending.id).collect();
-        if let Err(error) = send_error_responses(
-            connection,
-            definition_requests,
-            ErrorCode::RequestCanceled as i32,
-            format!("definition {message}"),
-        ) {
-            tracing::error!(error = %error, "failed to cancel definition package waiters");
-        }
+        let code = ErrorCode::RequestCanceled as i32;
+        log_drain(
+            cancel_drained(
+                connection,
+                self.semantic_token_requests.drain_package(key),
+                code,
+                format!("semantic token {message}"),
+            ),
+            "semantic token package waiters",
+        );
+        log_drain(
+            cancel_drained(
+                connection,
+                self.definition_requests.drain_package(key),
+                code,
+                format!("definition {message}"),
+            ),
+            "definition package waiters",
+        );
+        log_drain(
+            cancel_drained(
+                connection,
+                self.reference_requests.drain_package(key),
+                code,
+                format!("references {message}"),
+            ),
+            "references package waiters",
+        );
+        log_drain(
+            cancel_drained(connection, self.rename_requests.drain_package(key), code, format!("rename {message}")),
+            "rename package waiters",
+        );
+        log_drain(
+            cancel_drained(
+                connection,
+                self.prepare_rename_requests.drain_package(key),
+                code,
+                format!("prepare-rename {message}"),
+            ),
+            "prepare-rename package waiters",
+        );
     }
 
     /// Cancel semantic-token waiters tied to one document-view key.
@@ -825,6 +1589,180 @@ impl ServerState {
         ) {
             tracing::error!(uri = key.uri.as_str(), error = %error, "failed to cancel semantic token view waiters");
         }
+    }
+
+    /// Clear stale diagnostics for the buckets affected by a `didChange`.
+    ///
+    /// The edited URI clears with the incoming version; sibling URIs use
+    /// their own current open versions. Pending save publishes for the
+    /// affected buckets are dropped too.
+    fn clear_diagnostics_for_did_change(
+        &mut self,
+        connection: &Connection,
+        edited_uri: &Uri,
+        incoming_version: i32,
+        previous_bucket: Option<&AnalysisBucket>,
+        current_bucket: Option<&AnalysisBucket>,
+    ) {
+        let mut buckets: HashSet<AnalysisBucket> = HashSet::new();
+        if let Some(bucket) = previous_bucket {
+            buckets.insert(bucket.clone());
+        }
+        if let Some(bucket) = current_bucket {
+            buckets.insert(bucket.clone());
+        }
+        for bucket in &buckets {
+            self.clear_bucket(connection, bucket, Some((edited_uri, incoming_version)));
+        }
+        self.diagnostics.pending_by_package.retain(|key, _| !buckets.contains(&key.bucket));
+    }
+
+    /// Clear a single previously-published URI without touching its siblings.
+    fn clear_uri_only(&mut self, connection: &Connection, uri: &Uri) {
+        let Some(bucket) = self.documents.package_key(uri).map(|key| key.bucket) else {
+            return;
+        };
+        let was_published = self.diagnostics.published_by_bucket.get(&bucket).is_some_and(|uris| uris.contains(uri));
+        if !was_published {
+            return;
+        }
+        let version = self.documents.open_document(uri).map(|document| document.version);
+        if let Err(error) = send_publish_diagnostics(connection, uri, version, Vec::new()) {
+            tracing::error!(uri = uri.as_str(), error = %error, "failed to clear diagnostics for uri");
+        }
+        if let Some(uris) = self.diagnostics.published_by_bucket.get_mut(&bucket) {
+            uris.remove(uri);
+            if uris.is_empty() {
+                self.diagnostics.published_by_bucket.remove(&bucket);
+            }
+        }
+    }
+
+    /// Clear every previously-published URI in a bucket.
+    ///
+    /// When `edited_uri` is supplied, that URI's clear is stamped with the
+    /// supplied incoming `didChange` version; all other URIs use their own
+    /// current open versions (or none if no longer open).
+    fn clear_bucket(&mut self, connection: &Connection, bucket: &AnalysisBucket, edited_uri: Option<(&Uri, i32)>) {
+        let Some(uris) = self.diagnostics.published_by_bucket.remove(bucket) else {
+            return;
+        };
+        for uri in &uris {
+            let version = match edited_uri {
+                Some((edited, version)) if uri == edited => Some(version),
+                _ => self.documents.open_document(uri).map(|document| document.version),
+            };
+            if let Err(error) = send_publish_diagnostics(connection, uri, version, Vec::new()) {
+                tracing::error!(uri = uri.as_str(), error = %error, "failed to clear diagnostics for bucket uri");
+            }
+        }
+    }
+
+    /// Drop diagnostic state for a closed URI.
+    fn clear_diagnostics_for_did_close(&mut self, connection: &Connection, uri: &Uri) {
+        if let Err(error) = send_publish_diagnostics(connection, uri, None, Vec::new()) {
+            tracing::error!(uri = uri.as_str(), error = %error, "failed to clear diagnostics on close");
+        }
+        for uris in self.diagnostics.published_by_bucket.values_mut() {
+            uris.remove(uri);
+        }
+        self.diagnostics.published_by_bucket.retain(|_, uris| !uris.is_empty());
+        self.diagnostics.pending_by_package.retain(|_, pending| &pending.trigger_uri != uri);
+        self.diagnostics.untrusted_uris.remove(uri);
+    }
+
+    /// Publish a cached diagnostic set.
+    ///
+    /// Entries are grouped by the open URI their path resolves to;
+    /// diagnostics whose path is not currently open are suppressed.
+    /// Synthetic spanless entries are pinned to `trigger_uri`. After the
+    /// new publish lands, any URI from the bucket's previous publish set
+    /// that is no longer present receives an empty clear.
+    fn publish_diagnostic_set(&mut self, connection: &Connection, trigger_uri: &Uri, set: &DiagnosticSet) {
+        let bucket = set.key.bucket.clone();
+        let mut grouped: HashMap<Uri, (Option<i32>, Vec<Diagnostic>)> = HashMap::new();
+        for entry in set.entries.iter() {
+            let targets = self.entry_publish_targets(entry, &set.key, trigger_uri);
+            if targets.is_empty() {
+                continue;
+            }
+            let payload = entry_to_lsp_diagnostic(entry, &self.diagnostic_capabilities);
+            for (uri, version) in targets {
+                let bucket = grouped.entry(uri).or_insert_with(|| (Some(version), Vec::new()));
+                bucket.0 = Some(version);
+                bucket.1.push(payload.clone());
+            }
+        }
+
+        for (uri, (version, diagnostics)) in &grouped {
+            if let Err(error) = send_publish_diagnostics(connection, uri, *version, diagnostics.clone()) {
+                tracing::error!(uri = uri.as_str(), error = %error, "failed to publish diagnostics");
+            }
+        }
+
+        let previous = self.diagnostics.published_by_bucket.remove(&bucket).unwrap_or_default();
+        for uri in &previous {
+            if grouped.contains_key(uri) {
+                continue;
+            }
+            let version = self.documents.open_document(uri).map(|document| document.version);
+            if let Err(error) = send_publish_diagnostics(connection, uri, version, Vec::new()) {
+                tracing::error!(uri = uri.as_str(), error = %error, "failed to clear stale uri");
+            }
+        }
+
+        if !grouped.is_empty() {
+            self.diagnostics.published_by_bucket.insert(bucket, grouped.into_keys().collect());
+        }
+    }
+
+    /// Resolve one diagnostic entry to the open URI/version pairs that should
+    /// receive it. Returns at most one target per URI.
+    fn entry_publish_targets(
+        &self,
+        entry: &DiagnosticEntry,
+        key: &PackageAnalysisKey,
+        trigger_uri: &Uri,
+    ) -> Vec<(Uri, i32)> {
+        if entry.synthetic {
+            // Synthetic entries are pinned to the saved document.
+            return self
+                .documents
+                .open_document(trigger_uri)
+                .map(|document| vec![(trigger_uri.clone(), document.version)])
+                .unwrap_or_default();
+        }
+        let mut targets: Vec<(Uri, i32)> = self
+            .documents
+            .open_documents_for_path(entry.path.as_path())
+            .into_iter()
+            .filter(|target| target.package_key == *key)
+            .filter(|target| !self.diagnostics.untrusted_uris.contains(&target.uri))
+            .map(|target| (target.uri, target.version))
+            .collect();
+        targets.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        targets.dedup_by(|left, right| left.0 == right.0);
+        targets
+    }
+
+    /// Satisfy any pending save-triggered publish for a freshly cached package.
+    fn publish_pending_diagnostics(&mut self, connection: &Connection, key: &PackageAnalysisKey) {
+        let Some(pending) = self.diagnostics.pending_by_package.remove(key) else {
+            return;
+        };
+        if self.diagnostics.untrusted_uris.contains(&pending.trigger_uri) {
+            return;
+        }
+        let Some(current_key) = self.documents.package_key(&pending.trigger_uri) else {
+            return;
+        };
+        if &current_key != key || !self.package_freshness_ok(key) {
+            return;
+        }
+        let Some(package) = self.analysis.packages.get(key).cloned() else {
+            return;
+        };
+        self.publish_diagnostic_set(connection, &pending.trigger_uri, package.diagnostics.as_ref());
     }
 }
 
@@ -853,12 +1791,13 @@ impl AnalysisCaches {
     }
 
     /// Store a package analysis and enforce the routing-thread LRU cap.
-    fn store_package(&mut self, package: Arc<CachedPackageAnalysis>) {
+    fn store_package(&mut self, package: Arc<CachedPackageAnalysis>) -> Vec<PackageAnalysisKey> {
         self.failed_packages.remove(&package.key);
         if !self.packages.contains_key(&package.key) {
             self.package_order.push_back(package.key.clone());
         }
         self.packages.insert(package.key.clone(), package);
+        let mut evicted = Vec::new();
         // Bound package analyses separately from worker stub caches. This keeps
         // the routing thread from retaining package-sized indexes for closed or
         // long-idle generations.
@@ -866,8 +1805,10 @@ impl AnalysisCaches {
             if let Some(oldest) = self.package_order.pop_front() {
                 self.packages.remove(&oldest);
                 self.failed_packages.remove(&oldest);
+                evicted.push(oldest);
             }
         }
+        evicted
     }
 
     /// Remember that current package analysis failed so repeated requests fail fast.
@@ -1008,6 +1949,427 @@ impl DefinitionRequestState {
     }
 }
 
+impl ReferencesRequestState {
+    /// Queue a references request, enforcing global and per-package caps.
+    fn queue(
+        &mut self,
+        query: ReferenceQuery,
+        request_id: RequestId,
+        cancel: Arc<AtomicBool>,
+        dispatched: bool,
+    ) -> bool {
+        if self.pending_owner.len() >= MAX_PENDING_REFERENCES {
+            return false;
+        }
+        let package = query.view_key.package.clone();
+        let queue = self.pending_by_package.entry(package.clone()).or_default();
+        if queue.len() >= MAX_PENDING_REFERENCES_PER_KEY {
+            return false;
+        }
+        queue.push(PendingReferencesRequest { id: request_id.clone(), query, cancel, dispatched });
+        self.pending_owner.insert(request_id, package);
+        true
+    }
+
+    /// Return one pending references request without mutating ownership.
+    fn get(&self, request_id: &RequestId) -> Option<&PendingReferencesRequest> {
+        let package = self.pending_owner.get(request_id)?;
+        self.pending_by_package.get(package)?.iter().find(|pending| &pending.id == request_id)
+    }
+
+    /// Remove one pending references request by request ID.
+    fn remove_pending_request(&mut self, request_id: &RequestId) -> Option<PendingReferencesRequest> {
+        let package = self.pending_owner.remove(request_id)?;
+        let queue = self.pending_by_package.get_mut(&package)?;
+        let index = queue.iter().position(|pending| &pending.id == request_id)?;
+        let pending = queue.remove(index);
+        if queue.is_empty() {
+            self.pending_by_package.remove(&package);
+        }
+        Some(pending)
+    }
+
+    /// Mark undispatched requests for one package as handed to the response pool.
+    fn mark_undispatched(&mut self, package: &PackageAnalysisKey) -> Vec<PendingReferencesRequest> {
+        let Some(queue) = self.pending_by_package.get_mut(package) else {
+            return Vec::new();
+        };
+        let mut pending = Vec::new();
+        for request in queue.iter_mut() {
+            if !request.dispatched {
+                request.dispatched = true;
+                pending.push(request.clone());
+            }
+        }
+        pending
+    }
+
+    /// Drain references requests whose source document has closed.
+    fn clear_uri(&mut self, uri: &Uri) -> Vec<PendingReferencesRequest> {
+        let packages = self.pending_by_package.keys().cloned().collect::<Vec<_>>();
+        let mut cleared = Vec::new();
+        for package in packages {
+            let Some(queue) = self.pending_by_package.get_mut(&package) else {
+                continue;
+            };
+            let mut index = 0;
+            while index < queue.len() {
+                if &queue[index].query.view_key.uri == uri {
+                    let pending = queue.remove(index);
+                    self.pending_owner.remove(&pending.id);
+                    cleared.push(pending);
+                } else {
+                    index += 1;
+                }
+            }
+            if queue.is_empty() {
+                self.pending_by_package.remove(&package);
+            }
+        }
+        cleared
+    }
+
+    /// Drain references requests waiting on one package key.
+    fn take_package(&mut self, package: &PackageAnalysisKey) -> Vec<PendingReferencesRequest> {
+        let Some(requests) = self.pending_by_package.remove(package) else {
+            return Vec::new();
+        };
+        for request in &requests {
+            self.pending_owner.remove(&request.id);
+        }
+        requests
+    }
+
+    /// Drain references requests waiting on any package key in a bucket.
+    fn take_bucket(&mut self, bucket: &AnalysisBucket) -> Vec<PendingReferencesRequest> {
+        let packages =
+            self.pending_by_package.keys().filter(|package| &package.bucket == bucket).cloned().collect::<Vec<_>>();
+        packages.into_iter().flat_map(|package| self.take_package(&package)).collect()
+    }
+}
+
+impl RenameRequestState {
+    /// Queue a rename request, enforcing global and per-package caps.
+    fn queue(&mut self, query: RenameQuery, request_id: RequestId, cancel: Arc<AtomicBool>, dispatched: bool) -> bool {
+        if self.pending_owner.len() >= MAX_PENDING_RENAMES {
+            return false;
+        }
+        let package = query.view_key.package.clone();
+        let queue = self.pending_by_package.entry(package.clone()).or_default();
+        if queue.len() >= MAX_PENDING_RENAMES_PER_KEY {
+            return false;
+        }
+        queue.push(PendingRenameRequest { id: request_id.clone(), query, cancel, dispatched });
+        self.pending_owner.insert(request_id, package);
+        true
+    }
+
+    /// Return one pending rename request without mutating ownership.
+    fn get(&self, request_id: &RequestId) -> Option<&PendingRenameRequest> {
+        let package = self.pending_owner.get(request_id)?;
+        self.pending_by_package.get(package)?.iter().find(|pending| &pending.id == request_id)
+    }
+
+    /// Remove one pending rename request by request ID.
+    fn remove_pending_request(&mut self, request_id: &RequestId) -> Option<PendingRenameRequest> {
+        let package = self.pending_owner.remove(request_id)?;
+        let queue = self.pending_by_package.get_mut(&package)?;
+        let index = queue.iter().position(|pending| &pending.id == request_id)?;
+        let pending = queue.remove(index);
+        if queue.is_empty() {
+            self.pending_by_package.remove(&package);
+        }
+        Some(pending)
+    }
+
+    /// Mark undispatched rename requests for one package as handed to the response pool.
+    fn mark_undispatched(&mut self, package: &PackageAnalysisKey) -> Vec<PendingRenameRequest> {
+        let Some(queue) = self.pending_by_package.get_mut(package) else {
+            return Vec::new();
+        };
+        let mut pending = Vec::new();
+        for request in queue.iter_mut() {
+            if !request.dispatched {
+                request.dispatched = true;
+                pending.push(request.clone());
+            }
+        }
+        pending
+    }
+
+    /// Drain rename requests whose source document has closed.
+    fn clear_uri(&mut self, uri: &Uri) -> Vec<PendingRenameRequest> {
+        let packages = self.pending_by_package.keys().cloned().collect::<Vec<_>>();
+        let mut cleared = Vec::new();
+        for package in packages {
+            let Some(queue) = self.pending_by_package.get_mut(&package) else {
+                continue;
+            };
+            let mut index = 0;
+            while index < queue.len() {
+                if &queue[index].query.view_key.uri == uri {
+                    let pending = queue.remove(index);
+                    self.pending_owner.remove(&pending.id);
+                    cleared.push(pending);
+                } else {
+                    index += 1;
+                }
+            }
+            if queue.is_empty() {
+                self.pending_by_package.remove(&package);
+            }
+        }
+        cleared
+    }
+
+    /// Drain rename requests waiting on one package key.
+    fn take_package(&mut self, package: &PackageAnalysisKey) -> Vec<PendingRenameRequest> {
+        let Some(requests) = self.pending_by_package.remove(package) else {
+            return Vec::new();
+        };
+        for request in &requests {
+            self.pending_owner.remove(&request.id);
+        }
+        requests
+    }
+
+    /// Drain rename requests waiting on any package key in a bucket.
+    fn take_bucket(&mut self, bucket: &AnalysisBucket) -> Vec<PendingRenameRequest> {
+        let packages =
+            self.pending_by_package.keys().filter(|package| &package.bucket == bucket).cloned().collect::<Vec<_>>();
+        packages.into_iter().flat_map(|package| self.take_package(&package)).collect()
+    }
+}
+
+impl PrepareRenameRequestState {
+    /// Queue a prepare-rename request, enforcing global and per-package caps.
+    fn queue(&mut self, query: PrepareRenameQuery, request_id: RequestId) -> bool {
+        if self.pending_owner.len() >= MAX_PENDING_PREPARE_RENAMES {
+            return false;
+        }
+        let package = query.view_key.package.clone();
+        let queue = self.pending_by_package.entry(package.clone()).or_default();
+        if queue.len() >= MAX_PENDING_PREPARE_RENAMES_PER_KEY {
+            return false;
+        }
+        queue.push(PendingPrepareRenameRequest { id: request_id.clone(), query });
+        self.pending_owner.insert(request_id, package);
+        true
+    }
+
+    /// Remove one pending prepare-rename request by request ID.
+    fn remove_pending_request(&mut self, request_id: &RequestId) -> Option<PendingPrepareRenameRequest> {
+        let package = self.pending_owner.remove(request_id)?;
+        let queue = self.pending_by_package.get_mut(&package)?;
+        let index = queue.iter().position(|pending| &pending.id == request_id)?;
+        let pending = queue.remove(index);
+        if queue.is_empty() {
+            self.pending_by_package.remove(&package);
+        }
+        Some(pending)
+    }
+
+    /// Drain prepare-rename requests whose source document has closed.
+    fn clear_uri(&mut self, uri: &Uri) -> Vec<PendingPrepareRenameRequest> {
+        let packages = self.pending_by_package.keys().cloned().collect::<Vec<_>>();
+        let mut cleared = Vec::new();
+        for package in packages {
+            let Some(queue) = self.pending_by_package.get_mut(&package) else {
+                continue;
+            };
+            let mut index = 0;
+            while index < queue.len() {
+                if &queue[index].query.view_key.uri == uri {
+                    let pending = queue.remove(index);
+                    self.pending_owner.remove(&pending.id);
+                    cleared.push(pending);
+                } else {
+                    index += 1;
+                }
+            }
+            if queue.is_empty() {
+                self.pending_by_package.remove(&package);
+            }
+        }
+        cleared
+    }
+
+    /// Drain prepare-rename requests waiting on one package key.
+    fn take_package(&mut self, package: &PackageAnalysisKey) -> Vec<PendingPrepareRenameRequest> {
+        let Some(requests) = self.pending_by_package.remove(package) else {
+            return Vec::new();
+        };
+        for request in &requests {
+            self.pending_owner.remove(&request.id);
+        }
+        requests
+    }
+
+    /// Drain prepare-rename requests waiting on any package key in a bucket.
+    fn take_bucket(&mut self, bucket: &AnalysisBucket) -> Vec<PendingPrepareRenameRequest> {
+        let packages =
+            self.pending_by_package.keys().filter(|package| &package.bucket == bucket).cloned().collect::<Vec<_>>();
+        packages.into_iter().flat_map(|package| self.take_package(&package)).collect()
+    }
+}
+
+impl PendingRequest for PendingDefinitionRequest {
+    /// Return the JSON-RPC request ID this definition waiter answers.
+    fn id(&self) -> &RequestId {
+        &self.id
+    }
+}
+
+impl PendingRequest for PendingReferencesRequest {
+    /// Return the JSON-RPC request ID this references waiter answers.
+    fn id(&self) -> &RequestId {
+        &self.id
+    }
+
+    /// Expose the per-request cancel flag so a routing-thread cancel path can
+    /// flip it before the in-flight pool job emits a stale response.
+    fn cancel_flag(&self) -> Option<&Arc<AtomicBool>> {
+        Some(&self.cancel)
+    }
+}
+
+impl PendingRequest for PendingRenameRequest {
+    /// Return the JSON-RPC request ID this rename waiter answers.
+    fn id(&self) -> &RequestId {
+        &self.id
+    }
+
+    /// Expose the per-request cancel flag so a routing-thread cancel path can
+    /// flip it before the in-flight pool job emits a stale `WorkspaceEdit`.
+    fn cancel_flag(&self) -> Option<&Arc<AtomicBool>> {
+        Some(&self.cancel)
+    }
+}
+
+impl PendingRequest for PendingPrepareRenameRequest {
+    /// Return the JSON-RPC request ID this prepare-rename waiter answers.
+    fn id(&self) -> &RequestId {
+        &self.id
+    }
+}
+
+impl PendingFeature for SemanticTokenRequestState {
+    /// Pending semantic-token waiters carry no per-request payload beyond the ID.
+    type Request = RequestId;
+
+    /// Drain semantic-token waiters whose source document has closed.
+    fn drain_uri(&mut self, uri: &Uri) -> Vec<RequestId> {
+        self.clear_uri(uri)
+    }
+
+    /// Drain semantic-token waiters blocked on one package key.
+    fn drain_package(&mut self, key: &PackageAnalysisKey) -> Vec<RequestId> {
+        self.take_package(key)
+    }
+
+    /// Drain semantic-token waiters blocked on one analysis bucket.
+    fn drain_bucket(&mut self, bucket: &AnalysisBucket) -> Vec<RequestId> {
+        self.take_bucket(bucket)
+    }
+}
+
+impl PendingFeature for DefinitionRequestState {
+    /// Pending definition waiters retain their original cursor query.
+    type Request = PendingDefinitionRequest;
+
+    /// Drain definition waiters whose source document has closed.
+    fn drain_uri(&mut self, uri: &Uri) -> Vec<PendingDefinitionRequest> {
+        self.clear_uri(uri)
+    }
+
+    /// Drain definition waiters blocked on one package key.
+    fn drain_package(&mut self, key: &PackageAnalysisKey) -> Vec<PendingDefinitionRequest> {
+        self.take_package(key)
+    }
+
+    /// Drain definition waiters blocked on one analysis bucket.
+    fn drain_bucket(&mut self, bucket: &AnalysisBucket) -> Vec<PendingDefinitionRequest> {
+        self.take_bucket(bucket)
+    }
+}
+
+impl PendingFeature for ReferencesRequestState {
+    /// Pending references waiters carry a cancel flag observed by the response pool.
+    type Request = PendingReferencesRequest;
+
+    /// Drain references waiters whose source document has closed.
+    fn drain_uri(&mut self, uri: &Uri) -> Vec<PendingReferencesRequest> {
+        self.clear_uri(uri)
+    }
+
+    /// Drain references waiters blocked on one package key.
+    fn drain_package(&mut self, key: &PackageAnalysisKey) -> Vec<PendingReferencesRequest> {
+        self.take_package(key)
+    }
+
+    /// Drain references waiters blocked on one analysis bucket.
+    fn drain_bucket(&mut self, bucket: &AnalysisBucket) -> Vec<PendingReferencesRequest> {
+        self.take_bucket(bucket)
+    }
+}
+
+impl PendingFeature for RenameRequestState {
+    /// Pending rename waiters carry a cancel flag observed by the response pool.
+    type Request = PendingRenameRequest;
+
+    /// Drain rename waiters whose source document has closed.
+    fn drain_uri(&mut self, uri: &Uri) -> Vec<PendingRenameRequest> {
+        self.clear_uri(uri)
+    }
+
+    /// Drain rename waiters blocked on one package key.
+    fn drain_package(&mut self, key: &PackageAnalysisKey) -> Vec<PendingRenameRequest> {
+        self.take_package(key)
+    }
+
+    /// Drain rename waiters blocked on one analysis bucket.
+    fn drain_bucket(&mut self, bucket: &AnalysisBucket) -> Vec<PendingRenameRequest> {
+        self.take_bucket(bucket)
+    }
+}
+
+impl PendingFeature for PrepareRenameRequestState {
+    /// Pending prepare-rename waiters retain only cursor query state.
+    type Request = PendingPrepareRenameRequest;
+
+    /// Drain prepare-rename waiters whose source document has closed.
+    fn drain_uri(&mut self, uri: &Uri) -> Vec<PendingPrepareRenameRequest> {
+        self.clear_uri(uri)
+    }
+
+    /// Drain prepare-rename waiters blocked on one package key.
+    fn drain_package(&mut self, key: &PackageAnalysisKey) -> Vec<PendingPrepareRenameRequest> {
+        self.take_package(key)
+    }
+
+    /// Drain prepare-rename waiters blocked on one analysis bucket.
+    fn drain_bucket(&mut self, bucket: &AnalysisBucket) -> Vec<PendingPrepareRenameRequest> {
+        self.take_bucket(bucket)
+    }
+}
+
+/// Convert a prepare-rename target to the LSP wire payload.
+fn prepare_rename_response_value(
+    query: &PrepareRenameQuery,
+    package: &CachedPackageAnalysis,
+    source_path: &std::path::Path,
+    line_index: &line_index::LineIndex,
+) -> Value {
+    let Some(range) = prepare_rename_target(query, package, source_path) else {
+        return Value::Null;
+    };
+    let Some(lsp_range) = byte_range_to_lsp_range(line_index, range.start, range.end) else {
+        return Value::Null;
+    };
+    let response: Range = lsp_range;
+    serde_json::to_value(PrepareRenameResponse::Range(response)).expect("PrepareRenameResponse should serialize")
+}
+
 /// Collect initialize-time workspace roots using LSP's preferred fallback order.
 #[allow(deprecated)]
 fn collect_workspace_roots(params: &InitializeParams) -> Vec<PathBuf> {
@@ -1029,6 +2391,10 @@ fn collect_workspace_roots(params: &InitializeParams) -> Vec<PathBuf> {
 }
 
 /// Advertise the LSP capabilities implemented by this server.
+///
+/// `save.includeText = false` because the server has authoritative content
+/// from full-sync `didChange` already. `diagnosticProvider` is intentionally
+/// absent: this server ships push diagnostics only.
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
@@ -1036,10 +2402,15 @@ fn server_capabilities() -> ServerCapabilities {
             change: Some(TextDocumentSyncKind::FULL),
             will_save: None,
             will_save_wait_until: None,
-            save: None,
+            save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions { include_text: Some(false) })),
         })),
         semantic_tokens_provider: Some(semantic_tokens_capability()),
         definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
         ..Default::default()
     }
 }
@@ -1087,6 +2458,26 @@ fn send_ok_response(connection: &Connection, id: RequestId, result: Value) -> Re
     Ok(())
 }
 
+/// Send a `textDocument/publishDiagnostics` notification.
+///
+/// `version` is wired through verbatim so empty clears for previously open
+/// URIs can carry their open version while clears for never-opened URIs omit
+/// the version entirely.
+fn send_publish_diagnostics(
+    connection: &Connection,
+    uri: &Uri,
+    version: Option<i32>,
+    diagnostics: Vec<Diagnostic>,
+) -> Result<()> {
+    let params = PublishDiagnosticsParams { uri: uri.clone(), diagnostics, version };
+    let notification = Notification {
+        method: PUBLISH_DIAGNOSTICS.to_owned(),
+        params: serde_json::to_value(params).context("failed to serialize publishDiagnostics params")?,
+    };
+    connection.sender.send(Message::Notification(notification))?;
+    Ok(())
+}
+
 /// Send one JSON-RPC error response.
 fn send_error_response(connection: &Connection, id: RequestId, code: i32, message: impl Into<String>) -> Result<()> {
     let response =
@@ -1114,6 +2505,25 @@ fn send_definition_nulls(connection: &Connection, requests: Vec<PendingDefinitio
         send_ok_response(connection, request.id, Value::Null)?;
     }
     Ok(())
+}
+
+/// Send successful `null` references responses for requests orphaned by close.
+fn send_reference_nulls(connection: &Connection, requests: Vec<PendingReferencesRequest>) -> Result<()> {
+    for request in requests {
+        request.cancel.store(true, Ordering::SeqCst);
+        send_ok_response(connection, request.id, Value::Null)?;
+    }
+    Ok(())
+}
+
+/// Log and discard a `cancel_drained` failure without surfacing it to callers.
+///
+/// The drain helpers fan out across five pending-state owners; one feature's
+/// transport failure must not short-circuit the remaining four.
+fn log_drain(result: Result<()>, what: &'static str) {
+    if let Err(error) = result {
+        tracing::error!(error = %error, "failed to cancel {what}");
+    }
 }
 
 /// Send the same error payload to every queued waiter on a URI.
@@ -1176,12 +2586,13 @@ impl TestHooks {
 #[cfg(test)]
 mod tests {
     use super::{DID_CHANGE, TestHooks, run_with_hooks};
-    use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
+    use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
     use lsp_types::{
         CancelParams,
         DidChangeTextDocumentParams,
         DidOpenTextDocumentParams,
         NumberOrString,
+        Position,
         SemanticTokensParams,
         TextDocumentContentChangeEvent,
         TextDocumentItem,
@@ -1189,7 +2600,17 @@ mod tests {
         VersionedTextDocumentIdentifier,
     };
     use serde_json::{Value, json};
-    use std::{fs, path::Path, process::ExitCode, sync::Arc, thread, time::Duration};
+    use std::{
+        fs,
+        path::Path,
+        process::ExitCode,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
     use tempfile::tempdir;
 
     /// Spawn the real server loop over an in-memory transport.
@@ -1247,6 +2668,11 @@ mod tests {
         }
     }
 
+    /// Build a references query for direct pending-state tests.
+    fn reference_query(key: crate::document_store::DocumentViewKey) -> super::ReferenceQuery {
+        super::ReferenceQuery { offset: 0, position: Position::new(0, 0), view_key: key, include_declaration: true }
+    }
+
     /// Build isolated server state for direct state-machine tests.
     fn test_state() -> super::ServerState {
         super::ServerState {
@@ -1256,9 +2682,15 @@ mod tests {
             documents: crate::document_store::DocumentStore::default(),
             project_model: crate::project_model::ProjectModel::default(),
             scheduler: crate::scheduler::Scheduler::new(false),
+            response_pool: super::ResponsePool::new(),
             analysis: super::AnalysisCaches::default(),
             semantic_token_requests: super::SemanticTokenRequestState::default(),
             definition_requests: super::DefinitionRequestState::default(),
+            reference_requests: super::ReferencesRequestState::default(),
+            rename_requests: super::RenameRequestState::default(),
+            prepare_rename_requests: super::PrepareRenameRequestState::default(),
+            diagnostics: super::DiagnosticPublishState::default(),
+            diagnostic_capabilities: super::DiagnosticClientCapabilitySnapshot::default(),
             client_definition_link_support: false,
             hooks: TestHooks::default(),
         }
@@ -1301,6 +2733,105 @@ mod tests {
         assert!(state.analysis.in_flight_packages.is_empty());
         assert!(state.analysis.failed_views.is_empty());
         assert!(state.analysis.in_flight_views.is_empty());
+        state.scheduler.shutdown();
+    }
+
+    /// Build a one-entry `DiagnosticSet` keyed to the document at `uri`.
+    fn diagnostic_set_for_path(
+        state: &super::ServerState,
+        uri: &Uri,
+        path: &std::path::Path,
+        synthetic: bool,
+    ) -> super::DiagnosticSet {
+        use crate::features::diagnostics::{
+            DiagnosticEntry,
+            DiagnosticRange,
+            DiagnosticRelatedEntry,
+            DiagnosticSet,
+            DiagnosticSeverityInternal,
+        };
+        let key = state.documents.package_key(uri).expect("package key");
+        let entry = DiagnosticEntry {
+            path: Arc::new(path.to_path_buf()),
+            range: DiagnosticRange { start_line: 0, start_character: 0, end_line: 0, end_character: 1 },
+            severity: DiagnosticSeverityInternal::Error,
+            message: Arc::from("boom"),
+            related: Arc::from(Vec::<DiagnosticRelatedEntry>::new()),
+            synthetic,
+        };
+        DiagnosticSet { key, entries: Arc::from(vec![entry]) }
+    }
+
+    /// Drain the publishDiagnostics notifications observed on `client`.
+    fn drain_publish_notifications(client: &Connection) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(message) = client.receiver.recv_timeout(Duration::from_millis(20)) {
+            match message {
+                Message::Notification(notification) if notification.method == "textDocument/publishDiagnostics" => {
+                    out.push(notification.params)
+                }
+                Message::Notification(_) | Message::Response(_) | Message::Request(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Path-only diagnostic with no matching open document is suppressed.
+    #[test]
+    fn publish_suppresses_entries_without_open_uri() {
+        let (server, client) = Connection::memory();
+        let mut state = test_state();
+        let uri: Uri = "file:///tmp/a.leo".parse().expect("uri");
+        open_unmanaged_document(&mut state, &uri, 1, "program test.aleo {}\n");
+
+        let unrelated = std::path::PathBuf::from("/tmp/elsewhere.leo");
+        let set = diagnostic_set_for_path(&state, &uri, &unrelated, false);
+        state.publish_diagnostic_set(&server, &uri, &set);
+
+        assert!(drain_publish_notifications(&client).is_empty());
+        state.scheduler.shutdown();
+    }
+
+    /// A URI flagged untrusted does not receive a non-empty publish.
+    #[test]
+    fn publish_suppresses_untrusted_uris() {
+        let (server, client) = Connection::memory();
+        let mut state = test_state();
+        let path = std::path::PathBuf::from("/tmp/lsp-publish-test/main.leo");
+        let uri: Uri = "file:///tmp/lsp-publish-test/main.leo".parse().expect("uri");
+        state.documents.commit_open(state.documents.prepare_open(
+            uri.clone(),
+            "leo".to_owned(),
+            1,
+            "program test.aleo {}\n".to_owned(),
+            Some(Arc::new(path.clone())),
+            None,
+        ));
+        state.diagnostics.untrusted_uris.insert(uri.clone());
+
+        let set = diagnostic_set_for_path(&state, &uri, &path, false);
+        state.publish_diagnostic_set(&server, &uri, &set);
+
+        assert!(drain_publish_notifications(&client).is_empty());
+        state.scheduler.shutdown();
+    }
+
+    /// Synthetic entries always land on the trigger URI.
+    #[test]
+    fn publish_pins_synthetic_entries_to_trigger_uri() {
+        let (server, client) = Connection::memory();
+        let mut state = test_state();
+        let uri: Uri = "untitled:main.leo".parse().expect("uri");
+        open_unmanaged_document(&mut state, &uri, 1, "program test.aleo {}\n");
+        let path = std::path::PathBuf::from("/tmp/vfs/synthetic.leo");
+
+        let set = diagnostic_set_for_path(&state, &uri, &path, true);
+        state.publish_diagnostic_set(&server, &uri, &set);
+
+        let publishes = drain_publish_notifications(&client);
+        assert_eq!(publishes.len(), 1);
+        assert_eq!(publishes[0]["uri"], json!(uri.to_string()));
+        assert_eq!(publishes[0]["version"], json!(1));
         state.scheduler.shutdown();
     }
 
@@ -1401,6 +2932,63 @@ mod tests {
         assert_eq!(error.code, ErrorCode::RequestCanceled as i32);
         assert!(error.message.contains("cancelled"));
         assert!(state.semantic_token_requests.pending_by_key.is_empty());
+        state.scheduler.shutdown();
+    }
+
+    /// Verifies package cancellation drains pending references and flips pool cancel flags.
+    #[test]
+    fn package_cancellation_cancels_pending_references() {
+        let (server, client) = Connection::memory();
+        let mut state = test_state();
+        let uri: Uri = "untitled:main.leo".parse().expect("uri");
+
+        open_unmanaged_document(&mut state, &uri, 1, "program test.aleo {}\n");
+        let key = state.documents.document_view_key(&uri).expect("document view key");
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(state.reference_requests.queue(reference_query(key.clone()), 2.into(), Arc::clone(&cancel), true));
+
+        state.cancel_pending_package_requests(&server, &key.package, "package analysis was evicted from cache");
+
+        let response = recv_response(&client);
+        assert_eq!(response.id, 2.into());
+        let error = response.error.expect("cancelled references response");
+        assert_eq!(error.code, ErrorCode::RequestCanceled as i32);
+        assert!(error.message.contains("evicted"));
+        assert!(cancel.load(Ordering::SeqCst));
+        assert!(state.reference_requests.pending_by_package.is_empty());
+        assert!(state.reference_requests.pending_owner.is_empty());
+        state.scheduler.shutdown();
+    }
+
+    /// Verifies a late response-pool completion cannot steal a reused request ID.
+    #[test]
+    fn stale_reference_completion_with_reused_id_is_dropped() {
+        let (server, client) = Connection::memory();
+        let mut state = test_state();
+        let uri: Uri = "untitled:main.leo".parse().expect("uri");
+
+        open_unmanaged_document(&mut state, &uri, 1, "program test.aleo {}\n");
+        let key = state.documents.document_view_key(&uri).expect("document view key");
+        let request_id: RequestId = 2.into();
+        let old_cancel = Arc::new(AtomicBool::new(true));
+        let new_cancel = Arc::new(AtomicBool::new(false));
+        assert!(state.reference_requests.queue(
+            reference_query(key.clone()),
+            request_id.clone(),
+            Arc::clone(&new_cancel),
+            true,
+        ));
+
+        state.handle_response_completion(&server, super::ResponseCompletion::References {
+            id: request_id.clone(),
+            key: key.package,
+            cancel: old_cancel,
+            result: super::ResponseResult::Ok(Value::Null),
+        });
+
+        assert!(client.receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(state.reference_requests.get(&request_id).is_some());
+        assert!(!new_cancel.load(Ordering::SeqCst));
         state.scheduler.shutdown();
     }
 
@@ -1524,9 +3112,15 @@ mod tests {
             documents: crate::document_store::DocumentStore::default(),
             project_model: crate::project_model::ProjectModel::default(),
             scheduler: crate::scheduler::Scheduler::new(false),
+            response_pool: super::ResponsePool::new(),
             analysis: super::AnalysisCaches::default(),
             semantic_token_requests: super::SemanticTokenRequestState::default(),
             definition_requests: super::DefinitionRequestState::default(),
+            reference_requests: super::ReferencesRequestState::default(),
+            rename_requests: super::RenameRequestState::default(),
+            prepare_rename_requests: super::PrepareRenameRequestState::default(),
+            diagnostics: super::DiagnosticPublishState::default(),
+            diagnostic_capabilities: super::DiagnosticClientCapabilitySnapshot::default(),
             client_definition_link_support: false,
             hooks: TestHooks::default(),
         };

@@ -1,6 +1,12 @@
 [EPAR0370047] Error: expected type
-    ╭─[ compiler-test:29:1 ]
+    ╭─[ compiler-test:28:30 ]
     │
- 29 │                    // let swap = arr[j];
+ 28 │                    let swap: = arr[j];
 ────╯
-[EPAR0370003] Error: unexpected EOF
+[EPAR0370003] Error: unexpected end of file
+    ╭─[ compiler-test:36:7 ]
+    │
+ 36 │     }
+    │ 
+    │ Help: The parser reached the end of the file while still expecting more input. Complete the current item. Common causes are a missing `}`, `)`, or `;`.
+────╯

@@ -1,36 +1,60 @@
-[ECHI03712004] Error: Function `transfer` does not match the signature required by interface `lib.aleo/HasToken`.
+[ECHI03712004] Error: function `transfer` does not match the signature required by interface `lib.aleo/HasToken`
 Expected:
 fn transfer(t: lib.aleo::Token) -> lib.aleo::Token
 Found:
 fn transfer(t: lib.aleo::Token) -> lib.aleo::Token
     ╭─[ compiler-test:10:5 ]
     │
-    │ 
-    │ 
-    │ Help: Function signatures must match exactly: same parameter types, modes, order, and return type.
+ 10 │ ╭─▶     fn transfer(t: lib.aleo::Token) -> lib.aleo::Token {
+    ┆ ┆   
+ 12 │ ├─▶     }
+    │ │           
+    │ ╰─────────── 
+    │     
+    │     Help: Function signatures must match exactly: same parameter types, modes, order, and return type.
 ────╯
-[WPAR0370002] Warning: Record prototype `Token` does not constrain any fields beyond the implicit `owner: address`. Consider simplifying to `record Token;`.
-    ╭─[ compiler-test:13:2 ]
+[WPAR0370002] Warning: record prototype `Token` does not constrain any fields beyond the implicit `owner: address`
+    ╭─[ compiler-test:12:21 ]
     │
-    │ 
+ 12 │ ╭─▶ interface HasToken {
+    ┆ ┆   
+ 16 │ ├─▶     }
+    │ │           
+    │ ╰─────────── 
+    │     
+    │     Help: Simplify the declaration to `record Token;`.
 ────╯
 
 
 ---
 Note: Treating dependencies as Aleo produces different results:
 
-[ETYC0372083] Error: A program must have at least one entry point fn.
+[ETYC0372083] Error: a program must have at least one entry point fn
    ╭─[ compiler-test:4:9 ]
    │
  4 │ program other.aleo {
+   │ 
+   │ Help: Define at least one function inside the `program` block.
 ───╯
-[WPAR0370002] Warning: Record prototype `Token` does not constrain any fields beyond the implicit `owner: address`. Consider simplifying to `record Token;`.
-    ╭─[ compiler-test:13:2 ]
+[WPAR0370002] Warning: record prototype `Token` does not constrain any fields beyond the implicit `owner: address`
+    ╭─[ compiler-test:12:21 ]
     │
-    │ 
+ 12 │ ╭─▶ interface HasToken {
+    ┆ ┆   
+ 16 │ ├─▶     }
+    │ │           
+    │ ╰─────────── 
+    │     
+    │     Help: Simplify the declaration to `record Token;`.
 ────╯
-[WPAR0370002] Warning: Record prototype `Token` does not constrain any fields beyond the implicit `owner: address`. Consider simplifying to `record Token;`.
-    ╭─[ compiler-test:13:2 ]
+[WPAR0370002] Warning: record prototype `Token` does not constrain any fields beyond the implicit `owner: address`
+    ╭─[ compiler-test:12:21 ]
     │
-    │ 
+ 12 │ ╭─▶ interface HasToken {
+    ┆ ┆   
+ 16 │ ├─▶     }
+    │ │           
+    │ ╰─────────── 
+    │     
+    │     Help: Simplify the declaration to `record Token;`.
 ────╯

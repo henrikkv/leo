@@ -262,6 +262,11 @@ impl CodeGeneratingVisitor<'_> {
         let (operand, mut instructions) = self.visit_expression(&input.expression);
         let operand = operand.expect("Trying to cast an empty expression");
 
+        // if the source already has the target type, reuse its operand directly instead of emitting a no-op cast.
+        if self.state.type_table.get(&input.expression.id()).as_ref() == Some(&input.type_) {
+            return (operand, instructions);
+        }
+
         // Construct the destination register.
         let dest_reg = self.next_register();
 
@@ -1129,8 +1134,8 @@ impl CodeGeneratingVisitor<'_> {
         let new_reg = self.next_register();
         match typ {
             Type::Address => {
-                let ins = AleoStmt::Cast(register.clone(), new_reg.clone(), AleoType::Address);
-                ((AleoExpr::Reg(new_reg)), vec![ins])
+                let cast = AleoStmt::Cast(register.clone(), new_reg.clone(), AleoType::Address);
+                ((AleoExpr::Reg(new_reg)), vec![cast])
             }
             Type::Boolean => {
                 let ins = AleoStmt::Cast(register.clone(), new_reg.clone(), AleoType::Boolean);
@@ -1196,9 +1201,18 @@ impl CodeGeneratingVisitor<'_> {
                     .lookup_record(current_program, composite_location)
                     .or_else(|| self.state.symbol_table.lookup_struct(current_program, composite_location))
                     .unwrap();
-                let elems = comp
-                    .members
-                    .iter()
+                // Records are emitted with `owner` as the first field regardless of source
+                // order (see `visit_record` in `program.rs`), so reorder here too to keep
+                // the cast operand list aligned with the declared record schema.
+                // Empty-typed members (Type::Unit, zero-length arrays) are omitted by the
+                // record/struct declaration emitters in `program.rs`, so omit them here too
+                // to keep the cast operand list consistent with the declared schema.
+                let is_record = comp.is_record;
+                let owner = is_record.then(|| comp.members.iter().find(|m| m.identifier.name == sym::owner)).flatten();
+                let elems = owner
+                    .into_iter()
+                    .chain(comp.members.iter().filter(|m| !is_record || m.identifier.name != sym::owner))
+                    .filter(|member| !member.type_.is_empty())
                     .map(|member| {
                         AleoExpr::MemberAccess(Box::new(register.clone()), member.identifier.name.to_string())
                     })

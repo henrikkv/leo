@@ -1,0 +1,60 @@
+[WCEI03713002] Warning: the call to `caller.aleo::read_and_use_counter` runs after an interaction (`Final.run()`), and `caller.aleo::read_and_use_counter` itself performs checks or effects
+    ╭─[ compiler-test:27:5 ]
+    │
+ 27 │     read_and_use_counter();
+    │ 
+    │ Help: Move the call to `caller.aleo::read_and_use_counter` above the `.run()` call to avoid reentrancy issues.
+    │ 
+    │ Note: Under the Checks-Effects-Interactions pattern, any callee that performs checks or effects must run before any `.run()` calls in the same execution path.
+────╯
+program dep.aleo;
+
+mapping dep_data:
+    key as u32.public;
+    value as u32.public;
+
+function update:
+    input r0 as u32.private;
+    async update r0 into r1;
+    output r1 as dep.aleo/update.future;
+
+finalize update:
+    input r0 as u32.public;
+    set r0 into dep_data[0u32];
+
+constructor:
+    assert.eq edition 0u16;
+// --- Next Program --- //
+import dep.aleo;
+program caller.aleo;
+
+struct Optional__JzunLORyB8U:
+    is_some as boolean;
+    val as u32;
+
+mapping balances:
+    key as u32.public;
+    value as u32.public;
+
+mapping counter__:
+    key as boolean.public;
+    value as u32.public;
+
+function do_work:
+    input r0 as u32.private;
+    call dep.aleo/update r0 into r1;
+    async do_work r1 into r2;
+    output r2 as caller.aleo/do_work.future;
+
+finalize do_work:
+    input r0 as dep.aleo/update.future;
+    await r0;
+    contains counter__[false] into r1;
+    get.or_use counter__[false] 0u32 into r2;
+    ternary r1 r2 0u32 into r3;
+    cast r1 r3 into r4 as Optional__JzunLORyB8U;
+    ternary r4.is_some r4.val 0u32 into r5;
+    set r5 into balances[0u32];
+
+constructor:
+    assert.eq edition 0u16;

@@ -17,8 +17,13 @@
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
 
+mod errors;
+
 mod static_analysis;
 pub use static_analysis::*;
+
+mod cei_analysis;
+pub use cei_analysis::*;
 
 mod code_generation;
 pub use code_generation::*;
@@ -70,6 +75,9 @@ pub use path_resolution::*;
 
 mod pass;
 pub use pass::*;
+
+mod peephole_optimization;
+pub use peephole_optimization::*;
 
 mod processing_async;
 pub use processing_async::*;
