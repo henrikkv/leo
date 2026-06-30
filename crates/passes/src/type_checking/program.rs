@@ -80,8 +80,15 @@ impl UnitVisitor for TypeCheckingVisitor<'_> {
     fn visit_program_scope(&mut self, input: &ProgramScope) {
         let unit_name = input.program_id.as_symbol();
 
-        // Set the current program name.
+        // Set the current program name. Reset the module path; program scopes are top-level
+        // and must not inherit any leftover nesting from a previously visited module.
         self.scope_state.unit_name = Some(unit_name);
+        self.scope_state.module_name.clear();
+
+        // Reject inheriting from interfaces that aren't accessible from this program scope.
+        // Conformance/cycle checks happen later in `check_interfaces`; this is the visibility
+        // policy, which belongs in type-checking.
+        self.check_parent_interface_accessibility(&input.parents);
 
         // Collect a map from record names to their spans
         let record_info: BTreeMap<String, leo_span::Span> = input
@@ -163,9 +170,6 @@ impl UnitVisitor for TypeCheckingVisitor<'_> {
             }
         }
 
-        // Typecheck the constructor.
-        // Note: Constructors are required for all **new** programs once they are supported in the AVM.
-        //  However, we do not require them to exist to ensure backwards compatibility with existing programs.
         if let Some(constructor) = &input.constructor {
             self.visit_constructor(constructor);
         }
@@ -189,6 +193,12 @@ impl UnitVisitor for TypeCheckingVisitor<'_> {
             self.emit_err(crate::errors::type_checker::no_entry_points(
                 input.program_id.name.span + input.program_id.network.span,
             ));
+        }
+
+        // Imported Aleo bytecode dependencies are registered as stubs, so this local-source check
+        // does not require constructors on those dependencies.
+        if input.constructor.is_none() {
+            self.emit_err(crate::errors::type_checker::missing_constructor(input.program_id.span()));
         }
     }
 
@@ -215,8 +225,10 @@ impl UnitVisitor for TypeCheckingVisitor<'_> {
     }
 
     fn visit_library(&mut self, input: &Library) {
-        // Set the scope state.
+        // Set the scope state. Reset the module path; libraries are top-level and must not
+        // inherit any leftover nesting from a previously visited module.
         self.scope_state.unit_name = Some(input.name);
+        self.scope_state.module_name.clear();
 
         input.structs.iter().for_each(|(_, s)| self.visit_composite(s));
         input.consts.iter().for_each(|(_, c)| self.visit_const(c));
@@ -229,6 +241,9 @@ impl UnitVisitor for TypeCheckingVisitor<'_> {
     }
 
     fn visit_interface(&mut self, input: &Interface) {
+        // Reject inheriting from interfaces that aren't accessible from this declaration site.
+        self.check_parent_interface_accessibility(&input.parents);
+
         // Entry point functions declared in interfaces cannot have const generic parameters.
         for (_, prototype) in &input.functions {
             if !prototype.const_parameters.is_empty() {
@@ -335,7 +350,7 @@ impl UnitVisitor for TypeCheckingVisitor<'_> {
                 .iter()
                 .find_map(|Member { identifier, type_, .. }| (identifier.name == need).then_some((identifier, type_)))
             {
-                Some((_, actual_ty)) if expected_ty.eq_flat_relaxed(actual_ty) => {} // All good, found + right type!
+                Some((_, actual_ty)) if expected_ty.types_equivalent(actual_ty) => {} // All good, found + right type!
                 Some((field, _)) => {
                     self.emit_err(crate::errors::type_checker::record_var_wrong_type(field, expected_ty, input.span()));
                 }

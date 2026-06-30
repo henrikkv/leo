@@ -27,9 +27,12 @@ program test.aleo {
         let value: field = Deserialize::from_bits_raw::[field](bits);
         return value;
     }
+
+    @noupgrade
+    constructor() {}
 }
 
-final fn finalize(
+export final fn finalize(
     sig: [u8; 65],
     addr: [u8; 33],
     digest: [u8; 32],

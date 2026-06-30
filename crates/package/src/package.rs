@@ -43,6 +43,15 @@ pub struct Package {
     /// The directory on the filesystem where the package is located, canonicalized.
     pub base_directory: PathBuf,
 
+    /// Canonicalized workspace root, when the package lives inside a workspace
+    /// tree (an ancestor directory contains `workspace.json`). `None` for
+    /// standalone packages. When `Some`, `build_directory()` returns
+    /// `<workspace_root>/build/` so every package under the workspace root -
+    /// member or not - shares one flat, unit-keyed build root, and a unit
+    /// built once by any member is reused structurally by all the others.
+    /// Populated once in `from_directory_impl`; never mutated afterwards.
+    pub workspace_root: Option<PathBuf>,
+
     /// A topologically sorted list of all compilation units in this package, whether
     /// dependencies or the main program.
     ///
@@ -62,9 +71,12 @@ impl Package {
     /// The root of the build directory.
     ///
     /// This is the single place that knows where build artifacts are rooted;
-    /// every per-unit path below is composed from it.
+    /// every per-unit path below is composed from it. For a package inside a
+    /// workspace tree this returns `<workspace_root>/build/` so every member
+    /// shares one flat, unit-keyed build root; for a standalone package it
+    /// returns `<base_directory>/build/`.
     pub fn build_directory(&self) -> PathBuf {
-        self.base_directory.join(BUILD_DIRECTORY)
+        self.workspace_root.as_deref().unwrap_or(&self.base_directory).join(BUILD_DIRECTORY)
     }
 
     /// The package's own compilation unit, identified via the manifest.
@@ -171,6 +183,7 @@ impl Package {
             leo: env!("CARGO_PKG_VERSION").to_string(),
             dependencies: None,
             dev_dependencies: None,
+            no_std: false,
         };
 
         let manifest_path = full_path.join(MANIFEST_FILENAME);
@@ -244,6 +257,7 @@ impl Package {
             /* with_tests */ false,
             /* no_cache */ false,
             /* no_local */ false,
+            /* offline */ false,
             network,
             endpoint,
             network_retries,
@@ -252,11 +266,13 @@ impl Package {
 
     /// Examine the Leo package at `path` to create a `Package`, including all its dependencies,
     /// obtaining dependencies from the file system or network and topologically sorting them.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_directory<P: AsRef<Path>, Q: AsRef<Path>>(
         path: P,
         home_path: Q,
         no_cache: bool,
         no_local: bool,
+        offline: bool,
         network: Option<NetworkName>,
         endpoint: Option<&str>,
         network_retries: u32,
@@ -268,6 +284,7 @@ impl Package {
             /* with_tests */ false,
             no_cache,
             no_local,
+            offline,
             network,
             endpoint,
             network_retries,
@@ -276,11 +293,13 @@ impl Package {
 
     /// Examine the Leo package at `path` to create a `Package`, including all its dependencies
     /// and its tests, obtaining dependencies from the file system or network and topologically sorting them.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_directory_with_tests<P: AsRef<Path>, Q: AsRef<Path>>(
         path: P,
         home_path: Q,
         no_cache: bool,
         no_local: bool,
+        offline: bool,
         network: Option<NetworkName>,
         endpoint: Option<&str>,
         network_retries: u32,
@@ -292,6 +311,7 @@ impl Package {
             /* with_tests */ true,
             no_cache,
             no_local,
+            offline,
             network,
             endpoint,
             network_retries,
@@ -327,6 +347,7 @@ impl Package {
         with_tests: bool,
         no_cache: bool,
         no_local: bool,
+        offline: bool,
         network: Option<NetworkName>,
         endpoint: Option<&str>,
         network_retries: u32,
@@ -336,6 +357,11 @@ impl Package {
         };
 
         let path = path.canonicalize().map_err(|err| map_err(path, err))?;
+
+        // Detect an enclosing workspace so build artifacts route to a shared
+        // `<workspace_root>/build/`. The walk only checks for `workspace.json`
+        // (no manifest parsing, no member resolution), so it is cheap.
+        let workspace_root = Workspace::discover_root(&path)?;
 
         let manifest = Manifest::read_from_file(path.join(MANIFEST_FILENAME))?;
 
@@ -350,11 +376,18 @@ impl Package {
             // .aleo file import classification doesn't depend on processing order.
             let declared_deps = collect_declared_deps(&path, &manifest, with_tests)?;
 
+            // The lock lives at the workspace root, else beside this package's `program.json`.
+            let lock_dir = workspace_root.as_deref().unwrap_or(&path).to_path_buf();
+            // New lock records only this build's resolutions; others are carried over from the old lock after.
+            let old_lock = Lock::read(&lock_dir);
+            let mut new_lock = Lock::default();
+
             let first_dependency = Dependency {
                 name: manifest.program.clone(),
                 location: Location::Local,
                 path: Some(path.clone()),
                 edition: None,
+                ..Default::default()
             };
 
             let test_dependencies: Vec<Dependency> = if with_tests {
@@ -366,6 +399,7 @@ impl Package {
                         edition: None,
                         location: Location::Test,
                         path: Some(path.to_path_buf()),
+                        ..Default::default()
                     })
                     .collect();
                 if let Some(deps) = manifest.dev_dependencies.as_ref() {
@@ -389,8 +423,32 @@ impl Package {
                     no_local,
                     network_retries,
                     &declared_deps,
+                    &old_lock,
+                    &mut new_lock,
+                    offline,
                 )?;
             }
+
+            // Workspace: carry all entries since the lock is shared. Standalone: carry only dev-git
+            // names (a plain build skips dev deps, so their pins may legitimately be unresolved).
+            if workspace_root.is_some() {
+                new_lock.carry_over(&old_lock, |_| true);
+            } else {
+                let dev_git_names: Vec<&str> = if with_tests {
+                    Vec::new()
+                } else {
+                    manifest
+                        .dev_dependencies
+                        .iter()
+                        .flatten()
+                        .filter(|dep| dep.location == Location::Git)
+                        .map(|dep| dep.name.as_str())
+                        .collect()
+                };
+                new_lock.carry_over(&old_lock, |entry| dev_git_names.contains(&entry.name.as_str()));
+            }
+            // Persist the lock (and drop a stale one when no git deps remain).
+            new_lock.write(&lock_dir)?;
 
             let ordered_dependency_symbols =
                 digraph.post_order().map_err(|_| crate::errors::circular_dependency_error())?;
@@ -403,7 +461,7 @@ impl Package {
             (Vec::new(), DiGraph::default())
         };
 
-        Ok(Package { base_directory: path, compilation_units, manifest, dep_graph: digraph })
+        Ok(Package { base_directory: path, workspace_root, compilation_units, manifest, dep_graph: digraph })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -419,6 +477,9 @@ impl Package {
         no_local: bool,
         network_retries: u32,
         declared_deps: &IndexMap<Symbol, Dependency>,
+        old_lock: &Lock,
+        new_lock: &mut Lock,
+        offline: bool,
     ) -> Result<()> {
         let name_symbol = symbol(&new.name)?;
 
@@ -431,6 +492,7 @@ impl Package {
                 if new.location != existing_dep.location
                     || new.path != existing_dep.path
                     || new.edition != existing_dep.edition
+                    || new.git != existing_dep.git
                 {
                     return Err(crate::errors::conflicting_dependency(existing_dep, new).into());
                 }
@@ -469,6 +531,15 @@ impl Package {
                             network_retries,
                         )?
                     }
+                    (_, Location::Git) => CompilationUnit::from_git(
+                        name_symbol,
+                        &new,
+                        home_path,
+                        old_lock,
+                        new_lock,
+                        offline,
+                        declared_deps,
+                    )?,
                     (_, Location::Workspace) => {
                         return Err(anyhow!(
                             "Workspace dependency `{}` was not resolved before graph building. This is a compiler bug.",
@@ -487,6 +558,34 @@ impl Package {
 
         graph.add_node(name_symbol);
 
+        // Security: a package in a git checkout may only path-reference its own checkout.
+        // Intra-checkout deps were rewritten to git deps in `from_git`; any remaining path dep is an escape.
+        let checkouts_root = crate::git::checkouts_root(home_path);
+        if let ProgramData::SourcePath { directory, .. } = &unit.data
+            && directory.starts_with(&checkouts_root)
+        {
+            // The checkout root is `<checkouts_root>/<key>/<commit>`.
+            let checkout = directory
+                .strip_prefix(&checkouts_root)
+                .ok()
+                .and_then(|rel| {
+                    let mut components = rel.components();
+                    Some((components.next()?, components.next()?))
+                })
+                .map(|(key, commit)| checkouts_root.join(key).join(commit));
+            for dependency in unit.dependencies.iter() {
+                if let Some(path) = &dependency.path
+                    && !checkout.as_ref().is_some_and(|checkout| path.starts_with(checkout))
+                {
+                    return Err(crate::errors::invalid_manifest_dependency(
+                        &dependency.name,
+                        "a git dependency may only reference paths inside its own repository checkout",
+                    )
+                    .into());
+                }
+            }
+        }
+
         for dependency in unit.dependencies.iter() {
             let dependency_symbol = symbol(&dependency.name)?;
             graph.add_edge(name_symbol, dependency_symbol);
@@ -502,6 +601,9 @@ impl Package {
                 no_local,
                 network_retries,
                 declared_deps,
+                old_lock,
+                new_lock,
+                offline,
             )?;
         }
 
@@ -558,7 +660,7 @@ fn lib_template(name: &str) -> String {
         r#"// The '{name}' library.
 
 // Returns the identity of x.
-fn example(x: u32) -> u32 {{
+export fn example(x: u32) -> u32 {{
     return x;
 }}
 "#
@@ -637,8 +739,13 @@ mod tests {
     use super::*;
 
     fn dummy_package(base: &str) -> Package {
+        dummy_package_with(base, None)
+    }
+
+    fn dummy_package_with(base: &str, workspace_root: Option<PathBuf>) -> Package {
         Package {
             base_directory: PathBuf::from(base),
+            workspace_root,
             compilation_units: Vec::new(),
             manifest: Manifest {
                 program: "demo.aleo".to_string(),
@@ -648,6 +755,7 @@ mod tests {
                 leo: "0.0.0".to_string(),
                 dependencies: None,
                 dev_dependencies: None,
+                no_std: false,
             },
             dep_graph: DiGraph::default(),
         }
@@ -689,5 +797,31 @@ mod tests {
         // Every per-unit path is rooted at `build_directory()`, the single layout seam.
         assert!(pkg.unit_bytecode_path("x").starts_with(pkg.build_directory()));
         assert!(pkg.unit_interfaces_directory("credits.aleo").starts_with(pkg.build_directory()));
+    }
+
+    #[test]
+    fn workspace_root_routes_build_directory_to_shared() {
+        // When inside a workspace, `build_directory()` routes to the
+        // workspace root - not the package's own directory - so every
+        // member's per-unit subdirectory collapses under one shared
+        // `<root>/build/` and deduplicates structurally on unit name.
+        let pkg = dummy_package_with("/tmp/ws/members/token", Some(PathBuf::from("/tmp/ws")));
+        assert_eq!(pkg.build_directory(), PathBuf::from("/tmp/ws/build"));
+        assert_eq!(pkg.unit_build_directory("token"), PathBuf::from("/tmp/ws/build/token"));
+        assert_eq!(pkg.unit_bytecode_path("token"), PathBuf::from("/tmp/ws/build/token/token.aleo"));
+        // The package's own base_directory is irrelevant for the per-unit path:
+        // a workspace member and a separate dependency keyed by the same unit
+        // name resolve to byte-identical paths.
+        let dep = dummy_package_with("/tmp/ws/members/swap", Some(PathBuf::from("/tmp/ws")));
+        assert_eq!(pkg.unit_bytecode_path("token"), dep.unit_bytecode_path("token"));
+    }
+
+    #[test]
+    fn standalone_package_keeps_per_base_build_directory() {
+        // The standalone path must not change: a package outside any
+        // workspace still rooots its build under its own directory.
+        let pkg = dummy_package_with("/tmp/standalone", None);
+        assert_eq!(pkg.build_directory(), PathBuf::from("/tmp/standalone/build"));
+        assert_eq!(pkg.unit_build_directory("demo"), PathBuf::from("/tmp/standalone/build/demo"));
     }
 }

@@ -10,14 +10,17 @@ program child.aleo {
         let caller = self.caller;
         return final { finalize_boo(caller); };
     }
+
+    @noupgrade
+    constructor() {}
 }
 
-final fn finalize_foo(addr: address) {
+export final fn finalize_foo(addr: address) {
     let val: field = Mapping::get_or_use(count, addr, 0field);
     Mapping::set(count, addr, val + 1field);
 }
 
-final fn finalize_boo(addr: address) {
+export final fn finalize_boo(addr: address) {
     let val: field = Mapping::get_or_use(count, addr, 0field);
     Mapping::set(count, addr, val + 1field);
 }
@@ -43,4 +46,7 @@ program parent.aleo {
             f4.run();
         };
     }
+
+    @noupgrade
+    constructor() {}
 }

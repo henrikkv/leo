@@ -1,8 +1,8 @@
-struct Foo::[N: address] {
+export struct Foo::[N: address] {
     x: u32,
 }
 
-struct Goo::[P: u32] {
+export struct Goo::[P: u32] {
     z: Foo::[self.caller],
 }
 
@@ -13,4 +13,7 @@ program b28668.aleo {
         };
         return g.z.x;
     }
+
+    @noupgrade
+    constructor() {}
 }

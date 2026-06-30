@@ -56,7 +56,7 @@ impl Command for LeoTest {
     fn prelude(&self, context: Context) -> Result<Self::Input> {
         let mut options = self.compiler_options.clone();
         options.build_tests = true;
-        (LeoBuild { env_override: self.env_override.clone(), options }).execute(context)
+        (LeoBuild { env_override: self.env_override.clone(), options, rename: None }).execute(context)
     }
 
     fn apply(self, _: Context, input: Self::Input) -> Result<Self::Output> {
@@ -68,7 +68,7 @@ impl Command for LeoTest {
         // prelude+apply flow, because test needs to build and test each
         // member independently.
         match context.resolve_targets()? {
-            Some(targets) if targets.len() > 1 => {
+            Some((_, targets)) if targets.len() > 1 => {
                 let mut aggregate = TestOutput::default();
                 for target in &targets {
                     let member_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("?");
@@ -79,8 +79,8 @@ impl Command for LeoTest {
                     // Build with tests.
                     let mut opts = self.compiler_options.clone();
                     opts.build_tests = true;
-                    let package =
-                        (LeoBuild { env_override: self.env_override.clone(), options: opts }).execute(member_ctx)?;
+                    let package = (LeoBuild { env_override: self.env_override.clone(), options: opts, rename: None })
+                        .execute(member_ctx)?;
 
                     // Run tests for this member.
                     let member_test = LeoTest {
@@ -135,9 +135,6 @@ fn discover_test_functions(package: &Package, match_str: &str, network: NetworkN
             continue;
         };
 
-        let source_dir =
-            if unit.kind.is_test() { source.parent().unwrap().to_path_buf() } else { directory.join("src") };
-
         let handler = Handler::default();
         let node_builder = Rc::new(NodeBuilder::default());
 
@@ -152,7 +149,13 @@ fn discover_test_functions(package: &Package, match_str: &str, network: NetworkN
             network,
         );
 
-        let ast = compiler.parse_program_from_directory(source, &source_dir);
+        // A test is a single standalone file; its `tests/` siblings are independent programs,
+        // so parse only this file rather than scanning the directory for modules.
+        let ast = if unit.kind.is_test() {
+            compiler.parse_program_from_file(source)
+        } else {
+            compiler.parse_program_from_directory(source, directory.join("src"))
+        };
         let ast = match ast {
             Ok(ast) => ast,
             Err(_) => continue,

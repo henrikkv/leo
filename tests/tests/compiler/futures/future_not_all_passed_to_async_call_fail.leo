@@ -1,9 +1,9 @@
-final fn finalize_foo(addr: address) {
+export final fn finalize_foo(addr: address) {
     let val: field = Mapping::get_or_use(count, addr, 0field);
     Mapping::set(count, addr, val + 1field);
 }
 
-final fn finalize_boo(addr: address) {
+export final fn finalize_boo(addr: address) {
     let val: field = Mapping::get_or_use(count, addr, 0field);
     Mapping::set(count, addr, val + 1field);
 }
@@ -20,6 +20,9 @@ program child.aleo {
         let caller = self.caller;
         return final { finalize_boo(caller); };
     }
+
+    @noupgrade
+    constructor() {}
 }
 
 // --- Next Program --- //
@@ -37,9 +40,12 @@ program parent.aleo {
         // Doesn't pass f1.
         return final { finalize_foo(f0, f3, f2, f5, f4); };
     }
+
+    @noupgrade
+    constructor() {}
 }
 
-final fn finalize_foo(f0: Final, f1: Final, f2: Final, f3: Final, f4: Final) {
+export final fn finalize_foo(f0: Final, f1: Final, f2: Final, f3: Final, f4: Final) {
     f1.run();
     f4.run();
     f2.run();

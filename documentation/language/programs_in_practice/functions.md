@@ -20,6 +20,8 @@ Inputs are declared as `{visibility} {name}: {type}`. They must be declared just
 ```leo file=../../code_snippets/functions/entry_input/src/main.leo#snippet showLineNumbers
 ```
 
+A visibility modifier may not be applied to a record or `Final` parameter. Records are passed by their `.record` marker and `Final`s carry no visibility, so a `public` or `private` mode on them is meaningless and is rejected.
+
 ### Outputs
 
 The return type of the function is declared as `-> {expression}` and must be declared just after the function inputs.
@@ -27,6 +29,8 @@ A function output is calculated as `return {expression};`. Returning an output e
 
 ```leo file=../../code_snippets/functions/entry_output/src/main.leo#snippet showLineNumbers
 ```
+
+As with inputs, a record or `Final` output cannot carry a visibility modifier.
 
 ## On-chain State with `final { }`
 
@@ -47,6 +51,11 @@ When finalization logic is shared across multiple entry functions, it can be ext
 ```
 
 The body of `decrement_balance` is inlined into each caller's `final { }` block at compile time — no shared function exists in the compiled output.
+
+A `final fn` may also declare an output type and `return` a value, like an ordinary function. The result is bound at the call site inside the `final { }` block, which is useful for sharing a computed on-chain value across entry functions:
+
+```leo file=../../code_snippets/functions/final_fn_return/src/main.leo#file
+```
 
 ## View Functions
 
@@ -75,6 +84,10 @@ The same rule applies across programs — a `final {}` block can call a `view fn
 
 ```leo file=../../code_snippets/functions/view_cross_program_caller/src/main.leo#file showLineNumbers
 ```
+
+## The Constructor
+
+The `constructor` is the one other function-like declaration inside a `program {}` block. Unlike the entry, `final`, and `view` functions above, it is never called directly: the network runs it on-chain at deployment and on every upgrade to enforce the program's upgrade policy. It is documented alongside the other program-level declarations under [Constructor](../structure.md#constructor), with the full upgrade-policy semantics in the [Upgrading Programs guide](../../guides/program_upgradability.md).
 
 ## Helper Function
 
@@ -114,7 +127,7 @@ Use `@no_inline` when the function is intentionally shared across multiple call 
 Some helpers cannot exist as standalone AVM functions and **must** be inlined regardless of the annotation. In these cases the compiler ignores `@no_inline` and emits a warning at the annotation site:
 
 - helper functions defined in a submodule (`path::nested::fn`) — Aleo identifiers are flat, so there is no bytecode form for a nested name,
-- helper functions defined in a [library](../06_libraries.md) — libraries have no on-chain footprint,
+- helper functions defined in a [library](../libraries.md) — libraries have no on-chain footprint,
 - a `final fn`,
 - a helper reached from an on-chain context (a `constructor` or finalize block),
 - a helper with more than 16 arguments,
@@ -125,7 +138,7 @@ The annotation has no effect on entry `fn` declarations either — the entry-poi
 
 ### The `@inline` Annotation
 
-The compiler accepts `@inline` as a recognized annotation name, but **no compiler pass acts on it** — it is a silent no-op carried over from earlier Leo versions, where `inline` was a function-modifier keyword rather than an annotation (see [Migrating from Leo 3.5 to 4.0](../../guides/13_migration_3_5_to_4_0.md#inline-becomes-fn)). The default inlining behaviour described above is the same whether or not `@inline` is present, so prefer to leave it out of new code.
+The compiler accepts `@inline` as a recognized annotation name, but **no compiler pass acts on it** — it is a silent no-op carried over from earlier Leo versions, where `inline` was a function-modifier keyword rather than an annotation (see [Migrating from Leo 3.5 to 4.0](../../guides/migration_3_5_to_4_0.md#inline-becomes-fn)). The default inlining behaviour described above is the same whether or not `@inline` is present, so prefer to leave it out of new code.
 
 ## Function Call Rules
 

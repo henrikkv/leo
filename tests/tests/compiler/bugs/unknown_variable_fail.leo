@@ -1,4 +1,4 @@
-struct TokenInfo {
+export struct TokenInfo {
     name: field,
     symbol: field,
     decimals: u8,
@@ -8,7 +8,7 @@ struct TokenInfo {
     admin: address,
 }
 
-struct TestToken {
+export struct TestToken {
     name: field,
     symbol: field,
     decimals: u8,
@@ -17,7 +17,7 @@ struct TestToken {
     admin: address,
 }
 
-struct GlobalState {
+export struct GlobalState {
     next_token_id: field,
     admin: address,
 }
@@ -37,9 +37,12 @@ program test.aleo {
             },
         );
     }
+
+    @noupgrade
+    constructor() {}
 }
 
-final fn finalize_init(caller: address) {
+export final fn finalize_init(caller: address) {
     let gs: GlobalState = Mapping::get_or_use(
         global_state,
         true,

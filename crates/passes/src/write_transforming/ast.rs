@@ -91,6 +91,7 @@ impl WriteTransformingVisitor<'_> {
                         }
                     })
                     .collect(),
+                base: None,
                 path: comp_type.path,
                 span: Default::default(),
                 id,
@@ -228,6 +229,56 @@ impl AstReconstructor for WriteTransformingVisitor<'_> {
         (CastExpression { expression, ..input }.into(), statements)
     }
 
+    fn reconstruct_repeat(
+        &mut self,
+        input: RepeatExpression,
+        _additional: &(),
+    ) -> (Expression, Self::AdditionalOutput) {
+        let (expr, mut statements) = self.reconstruct_expression(input.expr, &());
+        let (count, statements2) = self.reconstruct_expression(input.count, &());
+        statements.extend(statements2);
+        (RepeatExpression { expr, count, ..input }.into(), statements)
+    }
+
+    fn reconstruct_dynamic_op(
+        &mut self,
+        input: DynamicOpExpression,
+        _additional: &(),
+    ) -> (Expression, Self::AdditionalOutput) {
+        let (target_program, mut statements) = self.reconstruct_expression(input.target_program, &());
+        let network = input.network.map(|n| {
+            let (expr, statements2) = self.reconstruct_expression(n, &());
+            statements.extend(statements2);
+            expr
+        });
+        let kind = match input.kind {
+            DynamicOpKind::Call { function, arguments } => {
+                let arguments = arguments
+                    .into_iter()
+                    .map(|arg| {
+                        let (expr, statements2) = self.reconstruct_expression(arg, &());
+                        statements.extend(statements2);
+                        expr
+                    })
+                    .collect();
+                DynamicOpKind::Call { function, arguments }
+            }
+            DynamicOpKind::Read { storage } => DynamicOpKind::Read { storage },
+            DynamicOpKind::Op { member, op, arguments } => {
+                let arguments = arguments
+                    .into_iter()
+                    .map(|arg| {
+                        let (expr, statements2) = self.reconstruct_expression(arg, &());
+                        statements.extend(statements2);
+                        expr
+                    })
+                    .collect();
+                DynamicOpKind::Op { member, op, arguments }
+            }
+        };
+        (DynamicOpExpression { target_program, network, kind, ..input }.into(), statements)
+    }
+
     fn reconstruct_composite_init(
         &mut self,
         mut input: CompositeExpression,
@@ -346,7 +397,7 @@ impl AstReconstructor for WriteTransformingVisitor<'_> {
             ..input
         }
         .into();
-        (stmt, Default::default())
+        (stmt, statements)
     }
 
     fn reconstruct_block(&mut self, block: Block) -> (Block, Self::AdditionalOutput) {
@@ -356,7 +407,7 @@ impl AstReconstructor for WriteTransformingVisitor<'_> {
         for statement in block.statements {
             let (reconstructed_statement, additional_statements) = self.reconstruct_statement(statement);
             statements.extend(additional_statements);
-            if !reconstructed_statement.is_empty() {
+            if !reconstructed_statement.is_removable() {
                 statements.push(reconstructed_statement);
             }
         }

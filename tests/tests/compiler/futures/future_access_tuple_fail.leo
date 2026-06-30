@@ -8,9 +8,12 @@ program credits.aleo {
         let f: Final = final { finalize(); };
         return (input, f);
     }
+
+    @noupgrade
+    constructor() {}
 }
 
-final fn finalize() {
+export final fn finalize() {
     assert_eq(1u8, 1u8);
 }
 
@@ -33,9 +36,12 @@ program test_credits.aleo {
             },
         );
     }
+
+    @noupgrade
+    constructor() {}
 }
 
-final fn finish(f1: Final, f2: Final) {
+export final fn finish(f1: Final, f2: Final) {
     f1.run();
     f2.run();
 }

@@ -31,6 +31,7 @@ use leo_package::{
     Manifest,
     PackageKind,
     ProgramData,
+    bare_unit_name,
     resolve_workspace_dependency,
 };
 use leo_passes::*;
@@ -95,16 +96,15 @@ pub struct Compiler {
     output_directory: PathBuf,
     /// The name of the compilation unit (program or library).
     pub unit_name: Option<String>,
+    /// When set, recompile under this on-chain name instead of the one the source
+    /// declares, so the bytecode is a distinct deployment. Used by `leo deploy --rename`.
+    pub rename: Option<String>,
     /// Options configuring compilation.
     compiler_options: CompilerOptions,
     /// State.
     state: CompilerState,
     /// The stubs for imported programs.
     import_stubs: IndexMap<Symbol, Stub>,
-    /// How many statements were in the AST before DCE?
-    pub statements_before_dce: u32,
-    /// How many statements were in the AST after DCE?
-    pub statements_after_dce: u32,
 }
 
 impl Compiler {
@@ -133,7 +133,7 @@ impl Compiler {
             .collect::<Vec<_>>();
 
         // Use the parser to construct the abstract syntax tree (ast).
-        let program = leo_parser::parse_program(
+        let mut program = leo_parser::parse_program(
             self.state.handler.clone(),
             &self.state.node_builder,
             &source_file,
@@ -141,13 +141,24 @@ impl Compiler {
             self.state.network,
         )?;
 
-        // Check that the name of its program scope matches the expected name.
+        // Capture the declared program name and span before any rewrite, so the
+        // borrow does not outlive a potential mutation below.
         // Note that parsing enforces that there is exactly one program scope in a file.
-        let program_scope = program.program_scopes.values().next().unwrap();
-        if let Some(unit_name) = &self.unit_name {
-            if unit_name != &program_scope.program_id.as_symbol().to_string() {
+        let (source_name, source_span) = {
+            let program_id = &program.program_scopes.values().next().unwrap().program_id;
+            (program_id.as_symbol().to_string(), program_id.span())
+        };
+
+        if let Some(rename) = self.rename.clone() {
+            let bare = bare_unit_name(&rename);
+            let program_scope = program.program_scopes.values_mut().next().unwrap();
+            program_scope.program_id.name.name = Symbol::intern(bare);
+            self.unit_name = Some(rename);
+        } else if let Some(unit_name) = &self.unit_name {
+            // Check that the name of its program scope matches the expected name.
+            if unit_name != &source_name {
                 return Err(crate::errors::program_name_should_match_file_name(
-                    program_scope.program_id.as_symbol(),
+                    Symbol::intern(&source_name),
                     // If this is a test, use the filename as the expected name.
                     if self.state.is_test {
                         format!(
@@ -157,12 +168,12 @@ impl Compiler {
                     } else {
                         format!("`{unit_name}` (specified in `program.json`)")
                     },
-                    program_scope.program_id.span(),
+                    source_span,
                 )
                 .into());
             }
         } else {
-            self.unit_name = Some(program_scope.program_id.as_symbol().to_string());
+            self.unit_name = Some(source_name);
         }
 
         self.state.ast = Ast::Program(program);
@@ -240,6 +251,11 @@ impl Compiler {
         // way programs do, so adopt the name supplied by the caller if none was pre-set.
         if self.unit_name.is_none() {
             self.unit_name = Some(library_name.to_string());
+        }
+
+        if self.compiler_options.initial_ast {
+            self.write_ast_to_json("initial.json")?;
+            self.write_ast("initial.ast")?;
         }
 
         Ok(())
@@ -328,10 +344,9 @@ impl Compiler {
             },
             output_directory,
             unit_name: expected_unit_name,
+            rename: None,
             compiler_options: compiler_options.unwrap_or_default(),
             import_stubs,
-            statements_before_dce: 0,
-            statements_after_dce: 0,
         }
     }
 
@@ -405,6 +420,9 @@ impl Compiler {
 
         self.frontend_passes()?;
 
+        // Drop unreachable library functions
+        self.do_pass::<LibraryPruning>(())?;
+
         self.do_pass::<ConstPropUnrollAndMorphing>(type_checking_config.clone())?;
 
         // Generate ABIs after monomorphization to capture concrete types.
@@ -438,9 +456,7 @@ impl Compiler {
 
         self.do_pass::<CommonSubexpressionEliminating>(())?;
 
-        let output = self.do_pass::<DeadCodeEliminating>(())?;
-        self.statements_before_dce = output.statements_before;
-        self.statements_after_dce = output.statements_after;
+        self.do_pass::<DeadCodeEliminating>(())?;
 
         Ok(abis)
     }
@@ -608,6 +624,27 @@ impl Compiler {
         self.compile(&source, FileName::Real(entry_file_path.as_ref().into()), &module_refs)
     }
 
+    /// Compiles a single standalone source file, without discovering sibling modules.
+    ///
+    /// Used for tests: each `tests/test_*.leo` is its own program, so its directory must not be
+    /// scanned for modules (the siblings are independent test programs, not submodules).
+    pub fn compile_from_file(&mut self, entry_file_path: impl AsRef<Path>) -> Result<Compiled> {
+        self.compile_from_file_with_file_source(entry_file_path, &DiskFileSource)
+    }
+
+    /// Compiles a single standalone source file using the given file source.
+    pub fn compile_from_file_with_file_source(
+        &mut self,
+        entry_file_path: impl AsRef<Path>,
+        file_source: &impl FileSource,
+    ) -> Result<Compiled> {
+        let entry_file_path = entry_file_path.as_ref();
+        let source = file_source
+            .read_file(entry_file_path)
+            .map_err(|e| crate::errors::file_read_error(entry_file_path.display().to_string(), e))?;
+        self.compile(&source, FileName::Real(entry_file_path.into()), &Vec::new())
+    }
+
     /// Parses a program from a source file and its associated module files in the same directory tree.
     pub fn parse_program_from_directory(
         &mut self,
@@ -632,6 +669,32 @@ impl Compiler {
 
         // Parse the main source along with all collected modules.
         self.parse_program(&source, FileName::Real(entry_file_path.as_ref().into()), &module_refs)?;
+
+        match &self.state.ast {
+            Ast::Program(program) => Ok(program.clone()),
+            Ast::Library(_) => unreachable!("expected Program AST"),
+        }
+    }
+
+    /// Parses a single standalone source file, without discovering sibling modules.
+    ///
+    /// Used for tests: each `tests/test_*.leo` is its own program, so its directory must not be
+    /// scanned for modules (the siblings are independent test programs, not submodules).
+    pub fn parse_program_from_file(&mut self, entry_file_path: impl AsRef<Path>) -> Result<Program> {
+        self.parse_program_from_file_with_file_source(entry_file_path, &DiskFileSource)
+    }
+
+    /// Parses a single standalone source file using the given file source.
+    pub fn parse_program_from_file_with_file_source(
+        &mut self,
+        entry_file_path: impl AsRef<Path>,
+        file_source: &impl FileSource,
+    ) -> Result<Program> {
+        let entry_file_path = entry_file_path.as_ref();
+        let source = file_source
+            .read_file(entry_file_path)
+            .map_err(|e| crate::errors::file_read_error(entry_file_path.display().to_string(), e))?;
+        self.parse_program(&source, FileName::Real(entry_file_path.into()), &[])?;
 
         match &self.state.ast {
             Ast::Program(program) => Ok(program.clone()),
@@ -677,20 +740,23 @@ impl Compiler {
 
     /// Writes the AST to a JSON file under the unit's snapshots directory.
     fn write_ast_to_json(&self, filename: &str) -> Result<()> {
-        match &self.state.ast {
-            Ast::Program(program) => {
-                // Snapshots are opt-in; create the directory lazily on first write.
-                fs::create_dir_all(&self.output_directory)
-                    .map_err(|e| crate::errors::failed_ast_file(self.output_directory.display(), e))?;
-                // Remove `Span`s if they are not enabled.
-                if self.compiler_options.ast_spans_enabled {
-                    program.to_json_file(self.output_directory.clone(), filename)?;
-                } else {
-                    program.to_json_file_without_keys(self.output_directory.clone(), filename, &["_span", "span"])?;
-                }
+        // No snapshots directory configured (parse-only preflight or LSP); skip rather than dump into the CWD.
+        if self.output_directory.as_os_str().is_empty() {
+            return Ok(());
+        }
+        // Snapshots are opt-in; create the directory lazily on first write.
+        fs::create_dir_all(&self.output_directory)
+            .map_err(|e| crate::errors::failed_ast_file(self.output_directory.display(), e))?;
+        let dir = self.output_directory.clone();
+        if self.compiler_options.ast_spans_enabled {
+            match &self.state.ast {
+                Ast::Program(program) => leo_ast::write_ast_json(program, dir, filename)?,
+                Ast::Library(library) => leo_ast::write_ast_json(library, dir, filename)?,
             }
-            Ast::Library(_) => {
-                // no-op for libraries
+        } else {
+            match &self.state.ast {
+                Ast::Program(program) => leo_ast::write_ast_json_filtered(program, dir, filename, &["_span", "span"])?,
+                Ast::Library(library) => leo_ast::write_ast_json_filtered(library, dir, filename, &["_span", "span"])?,
             }
         }
         Ok(())
@@ -698,15 +764,16 @@ impl Compiler {
 
     /// Writes the AST to a file (Leo syntax, not JSON) under the unit's snapshots directory.
     fn write_ast(&self, filename: &str) -> Result<()> {
+        // No snapshots directory configured (parse-only preflight or LSP); skip rather than dump into the CWD.
+        if self.output_directory.as_os_str().is_empty() {
+            return Ok(());
+        }
         // Snapshots are opt-in; create the directory lazily on first write.
         fs::create_dir_all(&self.output_directory)
             .map_err(|e| crate::errors::failed_ast_file(self.output_directory.display(), e))?;
         let full_filename = self.output_directory.join(filename);
 
-        let contents = match &self.state.ast {
-            Ast::Program(program) => program.to_string(),
-            Ast::Library(_) => String::new(), // empty for libraries
-        };
+        let contents = self.state.ast.to_string();
 
         fs::write(&full_filename, contents).map_err(|e| crate::errors::failed_ast_file(full_filename.display(), e))?;
 
@@ -729,6 +796,9 @@ impl Compiler {
     /// * `Err(CompilerError)` if any imported program cannot be found.
     pub fn add_import_stubs(&mut self) -> Result<()> {
         use indexmap::IndexSet;
+
+        // Inject the implicit standard library as a dependency of the current unit.
+        self.inject_std_library()?;
 
         // Track which programs we've already processed.
         let mut explored = IndexSet::<Symbol>::new();
@@ -831,6 +901,67 @@ impl Compiler {
         Ok(())
     }
 
+    /// Builds the implicit `std` library and returns it as a `Stub` with an empty parent set.
+    ///
+    /// Callers that compile multiple units against a shared `NodeBuilder` can invoke this once
+    /// and pass the resulting stub into each per-unit `Compiler` via `import_stubs`, avoiding
+    /// re-parsing and re-type-checking `std` for every unit.
+    pub fn build_std_stub(handler: Handler, node_builder: Rc<NodeBuilder>, network: NetworkName) -> Result<Stub> {
+        let std_name = Symbol::intern(leo_std::library_name());
+
+        let mut sub_compiler = Compiler::new(
+            Some(leo_std::library_name().to_string()),
+            false,
+            handler,
+            node_builder,
+            PathBuf::new(),
+            Some(CompilerOptions {
+                // avoid infinite recursion
+                no_std: true,
+                ..CompilerOptions::default()
+            }),
+            IndexMap::new(),
+            network,
+        );
+
+        let module_refs: Vec<(&str, FileName)> =
+            leo_std::modules().iter().map(|(path, source)| (*source, FileName::Custom((*path).to_string()))).collect();
+
+        // Skip the frontend here; every consuming compile re-runs it on the injected `FromLibrary` stub.
+        let library = sub_compiler.build_library_inner(
+            std_name,
+            leo_std::entry_source(),
+            FileName::Custom(format!("<{}>", leo_std::library_name())),
+            &module_refs,
+            false,
+        )?;
+
+        Ok(library.into())
+    }
+
+    /// Registers the implicit `std` library on `self.import_stubs`.
+    ///
+    /// Reuses an existing entry if one was preloaded
+    fn inject_std_library(&mut self) -> Result<()> {
+        if self.compiler_options.no_std {
+            return Ok(());
+        }
+
+        let std_name = Symbol::intern(leo_std::library_name());
+        let parent = Symbol::intern(self.unit_name.as_deref().expect("Cannot get unit name"));
+
+        if let Some(existing) = self.import_stubs.get_mut(&std_name) {
+            existing.add_parent(parent);
+            return Ok(());
+        }
+
+        let mut stub =
+            Self::build_std_stub(self.state.handler.clone(), Rc::clone(&self.state.node_builder), self.state.network)?;
+        stub.add_parent(parent);
+        self.import_stubs.insert(std_name, stub);
+        Ok(())
+    }
+
     /// Builds a library: parses the source, resolves import stubs, and runs all frontend passes.
     ///
     /// Unlike [`Self::compile`], this does not run monomorphisation, lowerings, or code generation.
@@ -843,9 +974,26 @@ impl Compiler {
         filename: FileName,
         modules: &[(&str, FileName)],
     ) -> Result<Library> {
+        self.build_library_inner(library_name, source, filename, modules, true)
+    }
+
+    /// Shared implementation of [`Self::build_library`] and [`Self::build_std_stub`].
+    ///
+    /// Parses the library, resolves its import stubs, and extracts the resulting [`Library`] AST.
+    /// When `run_frontend` is `true` the frontend passes also validate it.
+    fn build_library_inner(
+        &mut self,
+        library_name: Symbol,
+        source: &str,
+        filename: FileName,
+        modules: &[(&str, FileName)],
+        run_frontend: bool,
+    ) -> Result<Library> {
         self.parse_library(library_name, source, filename, modules)?;
         self.add_import_stubs()?;
-        self.frontend_passes()?;
+        if run_frontend {
+            self.frontend_passes()?;
+        }
 
         match &self.state.ast {
             Ast::Library(library) => Ok(library.clone()),
@@ -1174,7 +1322,7 @@ mod tests {
 
     use leo_ast::{NetworkName, NodeBuilder};
     use leo_errors::{BufferEmitter, Handler};
-    use leo_span::{Symbol, create_session_if_not_set_then, file_source::InMemoryFileSource};
+    use leo_span::{Symbol, create_session_if_not_set_then, file_source::InMemoryFileSource, source_map::FileName};
 
     use std::{path::PathBuf, rc::Rc};
 
@@ -1304,6 +1452,93 @@ mod tests {
                 "module `utils` should be loaded from the in-memory file source; found keys: {:?}",
                 ast.modules.keys().collect::<Vec<_>>()
             );
+        });
+    }
+
+    /// Verifies that a `rename` override recompiles the program under the new name:
+    /// the emitted bytecode header uses the renamed identity and the original name
+    /// does not leak, even though the source declares the old name.
+    #[test]
+    fn rename_override_recompiles_under_new_name() {
+        create_session_if_not_set_then(|_| {
+            let handler = Handler::default();
+            let node_builder = Rc::new(NodeBuilder::default());
+            let mut compiler = Compiler::new(
+                Some("foo.aleo".into()),
+                false,
+                handler,
+                node_builder,
+                PathBuf::from("/unused"),
+                None,
+                IndexMap::new(),
+                NetworkName::TestnetV0,
+            );
+            // Request deployment under a different name.
+            compiler.rename = Some("bar.aleo".into());
+
+            let source = concat!(
+                "program foo.aleo {\n",
+                "    record R {\n",
+                "        owner: address,\n",
+                "        x: bool,\n",
+                "    }\n",
+                "    @noupgrade\n",
+                "    constructor() {}\n",
+                "    fn foo() -> R {\n",
+                "        return R { owner: self.signer, x: true };\n",
+                "    }\n",
+                "}\n",
+            );
+            let filename = FileName::Custom("main.leo".into());
+            let modules: Vec<(&str, FileName)> = Vec::new();
+            let compiled = compiler
+                .compile(source, filename, &modules)
+                .unwrap_or_else(|err| panic!("compiling with rename failed: {err}"));
+
+            assert_eq!(compiler.unit_name.as_deref(), Some("bar.aleo"), "unit name should adopt the rename");
+            let bytecode = &compiled.primary.bytecode;
+            assert!(bytecode.contains("program bar.aleo;"), "expected renamed header, got:\n{bytecode}");
+            assert!(!bytecode.contains("program foo.aleo;"), "old name leaked into bytecode:\n{bytecode}");
+        });
+    }
+
+    /// Smoke test: `std` passes the full frontend on its own.
+    ///
+    /// `build_std_stub` no longer runs the frontend (consuming compiles re-run it), so this keeps a
+    /// standalone validation of `std`, catching errors in the library rather than in every build.
+    #[test]
+    fn std_library_passes_frontend() {
+        create_session_if_not_set_then(|_| {
+            let emitter = BufferEmitter::new();
+            let handler = Handler::new(emitter.clone());
+            let node_builder = Rc::new(NodeBuilder::default());
+            let mut compiler = Compiler::new(
+                Some(leo_std::library_name().to_string()),
+                false,
+                handler,
+                node_builder,
+                PathBuf::new(),
+                // `no_std` avoids injecting `std` into itself.
+                Some(crate::CompilerOptions { no_std: true, ..Default::default() }),
+                IndexMap::new(),
+                NetworkName::TestnetV0,
+            );
+
+            let module_refs: Vec<(&str, FileName)> = leo_std::modules()
+                .iter()
+                .map(|(path, source)| (*source, FileName::Custom((*path).to_string())))
+                .collect();
+
+            let result = compiler.build_library(
+                Symbol::intern(leo_std::library_name()),
+                leo_std::entry_source(),
+                FileName::Custom(format!("<{}>", leo_std::library_name())),
+                &module_refs,
+            );
+
+            assert!(result.is_ok(), "std failed to build: {:?}", result.err());
+            let errors = emitter.extract_errs().to_string();
+            assert!(errors.is_empty(), "std produced diagnostics:\n{errors}");
         });
     }
 }

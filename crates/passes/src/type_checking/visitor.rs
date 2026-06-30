@@ -96,6 +96,23 @@ impl TypeCheckingVisitor<'_> {
         self.conditional_scopes.last().map(|set| set.contains(&symbol)).unwrap_or(false)
     }
 
+    /// Emit `inaccessible_item` for each parent interface in `parents` whose declaration is
+    /// not visible to the current scope. Parents that don't resolve to a global location, or
+    /// whose target isn't found in the interface table, are skipped. Those are reported by
+    /// `check_interfaces`.
+    pub fn check_parent_interface_accessibility(&mut self, parents: &[(Span, leo_ast::Type)]) {
+        let current_program = self.scope_state.unit_name.expect("must be inside a compilation unit");
+        for (parent_span, parent_type) in parents {
+            let leo_ast::Type::Composite(leo_ast::CompositeType { path, .. }) = parent_type else { continue };
+            let Some(loc) = path.try_global_location() else { continue };
+            let Some(interface) = self.state.symbol_table.lookup_interface(current_program, loc) else { continue };
+            if !self.scope_state.is_accessible(loc, interface.is_exported) {
+                let name = interface.identifier.name;
+                self.emit_err(crate::errors::type_checker::inaccessible_item("interface", name, *parent_span));
+            }
+        }
+    }
+
     /// Emits a type checker error.
     pub fn emit_err(&self, err: impl Into<LeoError>) {
         self.state.handler.emit_err(err);
@@ -121,7 +138,7 @@ impl TypeCheckingVisitor<'_> {
     /// Emits an error if the two given types are not equal.
     pub fn check_eq_types(&self, t1: &Option<Type>, t2: &Option<Type>, span: Span) {
         match (t1, t2) {
-            (Some(t1), Some(t2)) if !t1.eq_user(t2) => {
+            (Some(t1), Some(t2)) if !t1.types_equivalent(t2) => {
                 self.emit_err(crate::errors::type_checker::type_should_be(t1, t2, span))
             }
             (Some(type_), None) | (None, Some(type_)) => {
@@ -1395,6 +1412,71 @@ impl TypeCheckingVisitor<'_> {
                 // Return the type.
                 Type::Address
             }
+            Intrinsic::FunctionChecksum => {
+                // The first argument is the program ID, the second the component name.
+                let (program_type, program_expr) = &arguments[0];
+                let program_span = program_expr.span();
+                // Check that the first argument is a program ID.
+                let program_id = match program_expr {
+                    Expression::Literal(Literal { variant: LiteralVariant::Address(s), .. })
+                        if program_id_regex.is_match(s) =>
+                    {
+                        Some(s.clone())
+                    }
+                    _ => {
+                        self.emit_err(crate::errors::type_checker::custom(
+                            "`Program::function_checksum` must be called on a program ID, e.g. `foo.aleo`",
+                            program_span,
+                        ));
+                        None
+                    }
+                };
+                self.assert_type(program_type, &Type::Address, program_span);
+                // Check that the second argument is an identifier literal naming the component, e.g. `'foo'`.
+                let (component_type, component_expr) = &arguments[1];
+                let component_span = component_expr.span();
+                let component = match component_expr {
+                    Expression::Literal(Literal { variant: LiteralVariant::Identifier(name), .. }) => {
+                        Some(name.clone())
+                    }
+                    _ => {
+                        self.emit_err(crate::errors::type_checker::custom(
+                            "the function name must be an identifier literal, e.g. `'foo'`",
+                            component_span,
+                        ));
+                        None
+                    }
+                };
+                self.assert_type(component_type, &Type::Identifier, component_span);
+                // Checksums exist only for externally-callable components — entry and view functions.
+                // Closures and `final fn`s are inlining artifacts with no stable identity, so reject
+                // anything that does not resolve to an entry or view function of the named (imported) program.
+                if let (Some(program_id), Some(component)) = (program_id, component) {
+                    let location = Location::new(Symbol::intern(&program_id), vec![Symbol::intern(&component)]);
+                    let current_unit = self.scope_state.unit_name.expect("type checking runs within a program");
+                    let is_entry_or_view = self
+                        .state
+                        .symbol_table
+                        .lookup_function(current_unit, &location)
+                        .is_some_and(|symbol| symbol.function.variant.is_externally_callable());
+                    if !is_entry_or_view {
+                        self.emit_err(crate::errors::type_checker::custom(
+                            format!("`{component}` must be an entry function or a view function of `{program_id}`"),
+                            component_span,
+                        ));
+                    }
+                }
+                // Return the type.
+                Type::Array(ArrayType::new(
+                    Type::Integer(IntegerType::U8),
+                    Expression::Literal(Literal::integer(
+                        IntegerType::U8,
+                        "32".to_string(),
+                        Default::default(),
+                        Default::default(),
+                    )),
+                ))
+            }
             Intrinsic::Serialize(variant) => {
                 // Determine the variant.
                 let is_raw = match variant {
@@ -1512,7 +1594,7 @@ impl TypeCheckingVisitor<'_> {
 
                     // Check that the input type is an array of the correct size.
                     let expected_type = Type::Array(ArrayType::bit_array(size_in_bits));
-                    if !input_type.eq_flat_relaxed(&expected_type) {
+                    if !input_type.types_equivalent(&expected_type) {
                         self.emit_err(crate::errors::type_checker::type_should_be2(
                             input_type,
                             format!("an array of {size_in_bits} bits"),
@@ -1792,9 +1874,17 @@ impl TypeCheckingVisitor<'_> {
             Type::String => {
                 self.emit_err(crate::errors::type_checker::strings_are_not_supported(span));
             }
-            // Check that named composite type has been defined.
-            Type::Composite(composite) if self.lookup_composite(composite.path.expect_global_location()).is_none() => {
-                self.emit_err(crate::errors::type_checker::undefined_type(composite.path.clone(), span));
+            // Check that named composite type has been defined and is accessible.
+            Type::Composite(composite) => {
+                let loc = composite.path.expect_global_location();
+                match self.lookup_composite(loc) {
+                    Some(comp) => {
+                        self.check_composite_accessible(loc, &comp, span);
+                    }
+                    None => {
+                        self.emit_err(crate::errors::type_checker::undefined_type(composite.path.clone(), span));
+                    }
+                }
             }
             // Check that the constituent types of the tuple are valid.
             Type::Tuple(tuple_type) => {
@@ -1867,7 +1957,6 @@ impl TypeCheckingVisitor<'_> {
 
             Type::Address
             | Type::Boolean
-            | Type::Composite(_)
             | Type::Field
             | Type::Future(_)
             | Type::Group
@@ -2205,13 +2294,6 @@ impl TypeCheckingVisitor<'_> {
             self.emit_err(crate::errors::type_checker::no_inline_not_allowed_on_final_fn(function.identifier.span()));
         }
 
-        if matches!(self.scope_state.variant, Some(Variant::FinalFn)) {
-            // final functions are not allowed to return values.
-            if !function.output.is_empty() {
-                self.emit_err(crate::errors::type_checker::final_fn_cannot_return_value(function.span()));
-            }
-        }
-
         for const_param in &function.const_parameters {
             self.visit_type(const_param.type_());
 
@@ -2311,6 +2393,22 @@ impl TypeCheckingVisitor<'_> {
                 _ => {} // Do nothing.
             }
 
+            // Records and `Final`s lower to `.record`/`.future` markers, neither of which carries a
+            // visibility, so an explicit mode on such an input is meaningless. (Non-entry variants
+            // already reject all input modes above, so this only adds the record/`Final` cases.)
+            if function.variant.is_entry() && input.mode() != Mode::None {
+                let kind = if self.type_is_record(table_type) {
+                    Some("record")
+                } else if matches!(table_type, Type::Future(_)) {
+                    Some("`Final`")
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    self.emit_err(crate::errors::type_checker::cannot_have_mode(kind, input.span()));
+                }
+            }
+
             if matches!(table_type, Type::Future(..)) {
                 // Future parameters may only appear in onchain functions.
                 // TODO: we may want to relax this
@@ -2376,14 +2474,36 @@ impl TypeCheckingVisitor<'_> {
             }
 
             // Check that the mode of the output is valid.
-            // For functions, only public and private outputs are allowed
-            if function_output.mode == Mode::Constant {
+            // Records and `Final`s lower to `.record`/`.future` markers, neither of which carries a
+            // visibility, so an explicit mode on such an output is meaningless. These types are only
+            // valid as outputs on entry points (other variants already error above).
+            let record_or_final_output = if self.type_is_record(&function_output.type_) {
+                Some("record")
+            } else if matches!(function_output.type_, Type::Future(_)) {
+                Some("`Final`")
+            } else {
+                None
+            };
+            if let Some(kind) = record_or_final_output {
+                if function.variant.is_entry() && function_output.mode != Mode::None {
+                    self.emit_err(crate::errors::type_checker::cannot_have_mode(kind, function_output.span));
+                }
+            } else if function_output.mode == Mode::Constant {
+                // For other types, only public and private outputs are allowed.
                 self.emit_err(crate::errors::type_checker::cannot_have_constant_output_mode(function_output.span));
             }
             // View outputs lower to `.public` from the variant alone, same as their inputs.
             if matches!(function.variant, Variant::View) && function_output.mode != Mode::None {
                 self.emit_err(crate::errors::type_checker::function_outputs_cannot_have_modes(
                     "`view fn`",
+                    function_output.span,
+                ));
+            }
+            // `final fn` helpers are inlined into their callsites, so their outputs never lower to
+            // AVM outputs and a visibility mode is meaningless.
+            if matches!(function.variant, Variant::FinalFn) && function_output.mode != Mode::None {
+                self.emit_err(crate::errors::type_checker::function_outputs_cannot_have_modes(
+                    "`final fn`",
                     function_output.span,
                 ));
             }
@@ -2424,8 +2544,19 @@ impl TypeCheckingVisitor<'_> {
             } else {
                 *lhs = Type::Err;
             }
-        } else if !lhs.eq_user(rhs) {
+        } else if !lhs.types_equivalent(rhs) {
             *lhs = Type::Err;
+        }
+    }
+
+    /// Returns `true` if `type_` resolves to a record, including dynamic interface records.
+    pub fn type_is_record(&mut self, type_: &Type) -> bool {
+        match type_ {
+            Type::DynRecord => true,
+            Type::Composite(composite) => {
+                self.lookup_composite(composite.path.expect_global_location()).is_some_and(|comp| comp.is_record)
+            }
+            _ => false,
         }
     }
 
@@ -2435,14 +2566,25 @@ impl TypeCheckingVisitor<'_> {
         let current_program = self.scope_state.unit_name.unwrap();
         let record_comp = self.state.symbol_table.lookup_record(current_program, loc);
         let comp = record_comp.or_else(|| self.state.symbol_table.lookup_struct(current_program, loc));
-        // Record the usage.
         if let Some(s) = comp {
+            // Record the usage.
             // If it's a struct or internal record, mark it used.
             if !s.is_record || Some(loc.program) == self.scope_state.unit_name {
                 self.used_composites.insert(loc.clone());
             }
         }
         comp.cloned()
+    }
+
+    /// Emits `inaccessible_item` if `comp` is not visible from the current scope. `span` is the
+    /// user's reference site, not the declaration. Returns `true` when accessible.
+    pub fn check_composite_accessible(&mut self, loc: &Location, comp: &Composite, span: Span) -> bool {
+        if self.scope_state.is_accessible(loc, comp.is_exported) {
+            return true;
+        }
+        let kind = if comp.is_record { "record" } else { "struct" };
+        self.emit_err(crate::errors::type_checker::inaccessible_item(kind, comp.identifier.name, span));
+        false
     }
 
     /// Replaces interface record types with `Type::DynRecord`. Only recurses into tuples — records cannot be nested inside structs or arrays.

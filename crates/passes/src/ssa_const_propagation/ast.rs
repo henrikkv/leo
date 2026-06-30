@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
 
+use crate::expression_can_be_discarded;
+
 use super::{
     SsaConstPropagationVisitor,
     visitor::{is_atom, is_one_literal, is_zero_literal, same_ssa_atom},
@@ -373,7 +375,7 @@ impl AstReconstructor for SsaConstPropagationVisitor<'_> {
         (UnaryExpression { receiver, ..input }.into(), None)
     }
 
-    /// Reconstruct a ternary expression and fold it if the condition is a constant.
+    /// Reconstruct a ternary expression and fold a constant condition only after both arms are reconstructed.
     fn reconstruct_ternary(
         &mut self,
         input: TernaryExpression,
@@ -381,20 +383,19 @@ impl AstReconstructor for SsaConstPropagationVisitor<'_> {
     ) -> (Expression, Self::AdditionalOutput) {
         let ternary_span = input.span();
         let (cond, cond_value) = self.reconstruct_expression(input.condition, &());
+        let (if_true, if_true_value) = self.reconstruct_expression(input.if_true, &());
+        let (if_false, if_false_value) = self.reconstruct_expression(input.if_false, &());
 
         match cond_value.and_then(|v| v.try_into().ok()) {
-            Some(true) => {
+            Some(true) if expression_can_be_discarded(&if_false, self.state) => {
                 self.changed = true;
-                self.reconstruct_expression(input.if_true, &())
+                (if_true, if_true_value)
             }
-            Some(false) => {
+            Some(false) if expression_can_be_discarded(&if_true, self.state) => {
                 self.changed = true;
-                self.reconstruct_expression(input.if_false, &())
+                (if_false, if_false_value)
             }
             _ => {
-                let (if_true, if_true_value) = self.reconstruct_expression(input.if_true, &());
-                let (if_false, if_false_value) = self.reconstruct_expression(input.if_false, &());
-
                 // Boolean branch folding: collapse a bool-literal-branched ternary.
                 // Commonly arises after composite forwarding erases an `is_some`-style
                 // flag that was selected across a ternary.
@@ -579,5 +580,35 @@ impl AstReconstructor for SsaConstPropagationVisitor<'_> {
 
     fn reconstruct_assign(&mut self, _input: AssignStatement) -> (Statement, Self::AdditionalOutput) {
         panic!("there should be no assignments at this stage");
+    }
+
+    /// Reconstruct a conditional statement and fold it if the condition is a constant.
+    ///
+    /// Constant conditions reach this pass when inlining substitutes literal arguments into a
+    /// finalize-context body, or when the iterative-inline weave const-specializes a duplicated
+    /// continuation. Both after the pre-flattening const propagation has already run. The
+    /// condition is an SSA atom at this point, so dropping it is side-effect-free, and the
+    /// untaken branch is statically dead.
+    fn reconstruct_conditional(&mut self, conditional: ConditionalStatement) -> (Statement, Self::AdditionalOutput) {
+        let (condition, condition_value) = self.reconstruct_expression(conditional.condition, &());
+
+        match condition_value.and_then(|v| v.try_into().ok()) {
+            Some(true) => {
+                self.changed = true;
+                (Statement::Block(self.reconstruct_block(conditional.then).0), None)
+            }
+            Some(false) => {
+                self.changed = true;
+                match conditional.otherwise {
+                    Some(otherwise) => self.reconstruct_statement(*otherwise),
+                    None => (Statement::dummy(), None),
+                }
+            }
+            _ => {
+                let then = self.reconstruct_block(conditional.then).0;
+                let otherwise = conditional.otherwise.map(|s| Box::new(self.reconstruct_statement(*s).0));
+                (ConditionalStatement { condition, then, otherwise, ..conditional }.into(), None)
+            }
+        }
     }
 }

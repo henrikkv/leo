@@ -7,9 +7,12 @@ program b28610.aleo {
         let signer = self.signer;
         return final { bar(signer); };
     }
+
+    @noupgrade
+    constructor() {}
 }
 
-final fn bar(addr: address) {
+export final fn bar(addr: address) {
     let t: Token = Token { owner: addr };
     assert(Token { owner: addr }.owner == addr);
 }

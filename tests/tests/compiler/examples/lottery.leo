@@ -15,9 +15,12 @@ program lottery.aleo {
             },
         );
     }
+
+    @noupgrade
+    constructor() {}
 }
 
-final fn finalize_play() {
+export final fn finalize_play() {
     // Check that the lottery has not expired.
     assert(block.height <= 1000u32);
 

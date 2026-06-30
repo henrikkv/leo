@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::errors::static_analyzer;
+use crate::{errors::static_analyzer, expression_can_be_discarded};
 use leo_ast::{
     const_eval::{self, Value},
     *,
@@ -98,7 +98,10 @@ impl AstReconstructor for ConstPropagationVisitor<'_> {
             }
         }
 
-        if values.len() == input.members.len() && input.const_arguments.is_empty() {
+        input.base = input.base.take().map(|base| Box::new(self.reconstruct_expression(*base, &()).0));
+
+        // A struct update (`..base`) only lists a subset of fields, so it can't fold to a const struct.
+        if input.base.is_none() && values.len() == input.members.len() && input.const_arguments.is_empty() {
             let value = Value::make_struct(
                 input.members.iter().map(|mem| mem.identifier.name).zip(values),
                 input.path.expect_global_location().clone(),
@@ -115,20 +118,23 @@ impl AstReconstructor for ConstPropagationVisitor<'_> {
         _additional: &(),
     ) -> (Expression, Self::AdditionalOutput) {
         let (cond, cond_value) = self.reconstruct_expression(input.condition, &());
+        let cond_bool = cond_value.and_then(|v| v.try_into().ok());
 
-        match cond_value.and_then(|v| v.try_into().ok()) {
-            Some(true) => self.reconstruct_expression(input.if_true, &()),
-            Some(false) => self.reconstruct_expression(input.if_false, &()),
-            _ => (
-                TernaryExpression {
-                    condition: cond,
-                    if_true: self.reconstruct_expression(input.if_true, &()).0,
-                    if_false: self.reconstruct_expression(input.if_false, &()).0,
-                    ..input
-                }
-                .into(),
-                None,
-            ),
+        if self.fold_const_initializer_ternaries {
+            match cond_bool {
+                Some(true) => return self.reconstruct_expression(input.if_true, &()),
+                Some(false) => return self.reconstruct_expression(input.if_false, &()),
+                _ => {}
+            }
+        }
+
+        let (if_true, if_true_value) = self.reconstruct_expression(input.if_true, &());
+        let (if_false, if_false_value) = self.reconstruct_expression(input.if_false, &());
+
+        match cond_bool {
+            Some(true) if expression_can_be_discarded(&if_false, self.state) => (if_true, if_true_value),
+            Some(false) if expression_can_be_discarded(&if_true, self.state) => (if_false, if_false_value),
+            _ => (TernaryExpression { condition: cond, if_true, if_false, ..input }.into(), None),
         }
     }
 
@@ -514,7 +520,7 @@ impl AstReconstructor for ConstPropagationVisitor<'_> {
                 let bogus_statement = Statement::dummy();
                 let this_statement = std::mem::replace(statement, bogus_statement);
                 *statement = slf.reconstruct_statement(this_statement).0;
-                !statement.is_empty()
+                !statement.is_removable()
             });
             (block, None)
         })
@@ -554,7 +560,7 @@ impl AstReconstructor for ConstPropagationVisitor<'_> {
         let span = input.span();
 
         let type_ = self.reconstruct_type(input.type_).0;
-        let (expr, opt_value) = self.reconstruct_expression(input.value, &());
+        let (expr, opt_value) = self.in_const_initializer(|slf| slf.reconstruct_expression(input.value, &()));
 
         if opt_value.is_some() {
             if self.state.symbol_table.global_scope() {

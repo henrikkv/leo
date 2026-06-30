@@ -22,6 +22,9 @@ program test_dep.aleo {
         let l: yeets = yeets { owner: self.signer, val: 1u32 };
         return (l, f);
     }
+
+    @noupgrade
+    constructor() {}
 }
 
 // --- Next Program --- //
@@ -51,6 +54,9 @@ program test.aleo {
         };
         return (a, f3);
     }
+
+    @noupgrade
+    constructor() {}
 }
 
 // --- Next Program --- //
@@ -70,6 +76,9 @@ program wrapper.aleo {
         };
         return (val, f4);
     }
+
+    @noupgrade
+    constructor() {}
 }
 
 // --- Next Program --- //
@@ -94,8 +103,11 @@ program big_wrapper.aleo {
         let f2: Final = final { finalize_main(f); };
         return (val, f2);
     }
+
+    @noupgrade
+    constructor() {}
 }
 
-final fn finalize_main(f: Final) {
+export final fn finalize_main(f: Final) {
     f.run();
 }

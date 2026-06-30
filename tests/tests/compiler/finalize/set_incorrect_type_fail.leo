@@ -1,4 +1,4 @@
-struct Token {
+export struct Token {
     owner_addr: address,
     amount: u128,
 }
@@ -11,9 +11,12 @@ program test.aleo {
         let caller = self.caller;
         return final { finalize_decrease_self(caller, amount); };
     }
+
+    @noupgrade
+    constructor() {}
 }
 
-final fn finalize_decrease_self(addr: address, amount: u128) {
+export final fn finalize_decrease_self(addr: address, amount: u128) {
     Mapping::set(tokens, addr, amount);
     tokens.set(addr, amount);
     Mapping::set(amounts, 1u8, amount);

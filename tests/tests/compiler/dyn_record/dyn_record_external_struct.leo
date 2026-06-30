@@ -1,4 +1,4 @@
-struct Metadata {
+export struct Metadata {
     amount: u64,
 }
 
@@ -25,4 +25,7 @@ program test.aleo {
         let m: token.aleo::Metadata = d.meta;
         return m.amount;
     }
+
+    @noupgrade
+    constructor() {}
 }

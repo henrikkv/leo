@@ -1,8 +1,8 @@
-struct Bar {
+export struct Bar {
     x: u8?,
 }
 
-struct Foo {
+export struct Foo {
     b: Bar,
 }
 
@@ -14,9 +14,12 @@ program test.aleo {
     fn bar(x: u8?, f: Foo) {
         return final {};
     }
+
+    @noupgrade
+    constructor() {}
 }
 
 @no_inline
-fn baz(x: u8?) -> u8? {
+export fn baz(x: u8?) -> u8? {
     return x;
 }

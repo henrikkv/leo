@@ -1,11 +1,11 @@
-interface Bar {
+export interface Bar {
     record Foo;
 }
 
-interface Baz: Bar {
+export interface Baz: Bar {
 }
 
-interface AbstractFoo: Baz {
+export interface AbstractFoo: Baz {
     record Foo;
     fn foobar() -> Foo;
 }
@@ -19,4 +19,7 @@ program scratch.aleo: AbstractFoo {
     fn foobar() -> Foo {
         return Foo { owner: self.signer, num: 42 };
     }
+
+    @noupgrade
+    constructor() {}
 }

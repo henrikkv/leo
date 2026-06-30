@@ -57,6 +57,10 @@ pub struct LeoUpgrade {
     #[clap(flatten)]
     pub(crate) env_override: EnvOptions,
     #[clap(flatten)]
+    pub(crate) key_override: PrivateKeyOptions,
+    #[clap(flatten)]
+    pub(crate) consensus_override: ConsensusOptions,
+    #[clap(flatten)]
     pub(crate) extra: ExtraOptions,
     #[clap(long, help = "Skips the upgrade of any program that contains one of the given substrings.", value_delimiter = ',', num_args = 1..)]
     pub(crate) skip: Vec<String>,
@@ -82,6 +86,7 @@ impl Command for LeoUpgrade {
                 options.no_cache = true;
                 options
             },
+            rename: None,
         }
         .execute(context)
     }
@@ -120,7 +125,7 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
     }
 
     // Get the private key and associated address, accounting for overrides.
-    let private_key = get_private_key(&command.env_override.private_key)?;
+    let private_key = get_private_key(&command.key_override.private_key)?;
     let address =
         Address::try_from(&private_key).map_err(|e| crate::errors::custom(format!("Failed to parse address: {e}")))?;
 
@@ -128,11 +133,14 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
     let endpoint = get_endpoint(&command.env_override.endpoint)?;
 
     // Get whether the network is a devnet, accounting for overrides.
-    let is_devnet = get_is_devnet(command.env_override.devnet);
+    let is_devnet = get_is_devnet(command.consensus_override.devnet);
 
     // If the consensus heights are provided, use them; otherwise, use the default heights for the network.
-    let consensus_heights =
-        command.env_override.consensus_heights.clone().unwrap_or_else(|| get_consensus_heights(network, is_devnet));
+    let consensus_heights = command
+        .consensus_override
+        .consensus_heights
+        .clone()
+        .unwrap_or_else(|| get_consensus_heights(network, is_devnet));
     // Validate the provided consensus heights.
     validate_consensus_heights(&consensus_heights)
         .map_err(|e| crate::errors::custom(format!("Invalid consensus heights: {e}")))?;
@@ -181,7 +189,7 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
     let tasks: Vec<Task<N>> = programs_and_bytecode
         .into_iter()
         .zip(fee_options)
-        .map(|((program, bytecode), (_base_fee, priority_fee, record))| {
+        .map(|((program, bytecode), (priority_fee, record))| {
             let id_str = format!("{}", program.name);
             let id = id_str
                 .parse()
@@ -226,6 +234,13 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
         command.env_override.network_retries,
     )?;
 
+    // Fail closed for proven-invalid upgrades by using the stricter active endpoint rules; fetch uncertainty remains a warning below.
+    let validation_consensus_version =
+        get_endpoint_consensus_version(&endpoint, network, command.env_override.network_retries)
+            .map_or(consensus_version, |network_version| consensus_version.max(network_version));
+    let remote_programs =
+        validate_upgrade_tasks(&endpoint, network, &local, &skipped, validation_consensus_version, command)?;
+
     // Build the config for JSON output.
     let config = Some(Config {
         address: address.to_string(),
@@ -243,7 +258,7 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
         &local,
         &skipped,
         &remote,
-        &check_tasks_for_warnings(&endpoint, network, &local, consensus_version, command),
+        &check_tasks_for_warnings(&endpoint, network, &local, &remote_programs, consensus_version, command),
         consensus_version,
         &command.into(),
     );
@@ -356,6 +371,9 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
 
             // Print the deployment summary and save the transaction and stats.
             print_deployment_summary(&id.to_string(), &stats);
+            if command.action.broadcast {
+                warn_if_transaction_oversized(&id, &transaction, consensus_version, "upgrade");
+            }
             transactions.push((id, transaction));
             all_stats.push(stats);
         }
@@ -466,6 +484,79 @@ fn handle_upgrade<N: Network, A: Aleo<Network = N>>(
     Ok(build_deploy_output(config, &transactions, &all_stats, &all_broadcasts))
 }
 
+fn validate_upgrade_tasks<N: Network>(
+    endpoint: &str,
+    network: NetworkName,
+    tasks: &[Task<N>],
+    skipped: &HashSet<ProgramID<N>>,
+    consensus_version: ConsensusVersion,
+    command: &LeoUpgrade,
+) -> Result<Vec<(ProgramID<N>, Program<N>)>> {
+    let mut remote_programs = Vec::with_capacity(tasks.len());
+
+    for Task { id, program, is_local, .. } in tasks {
+        // A proven-invalid upgrade is rejected before transaction construction in every output mode.
+        if !is_local || skipped.contains(id) {
+            continue;
+        }
+
+        let Ok(remote_program) =
+            fetch_program_from_network(&id.to_string(), endpoint, network, command.env_override.network_retries)
+        else {
+            // Fetch uncertainty remains in `check_tasks_for_warnings` so transient network state does not block planning.
+            continue;
+        };
+        let Ok(remote_program) = Program::<N>::from_str(&remote_program) else {
+            continue;
+        };
+        reject_invalid_upgrade(id, &remote_program, program, consensus_version)?;
+        remote_programs.push((*id, remote_program));
+    }
+
+    Ok(remote_programs)
+}
+
+fn get_endpoint_consensus_version(
+    endpoint: &str,
+    network: NetworkName,
+    network_retries: u32,
+) -> Option<ConsensusVersion> {
+    let response = leo_package::fetch_from_network(&format!("{endpoint}/{network}/consensus_version"), network_retries)
+        .ok()?
+        .parse::<u8>()
+        .ok()?;
+
+    number_to_consensus_version(response as usize).ok()
+}
+
+fn reject_invalid_upgrade<N: Network>(
+    id: &ProgramID<N>,
+    remote_program: &Program<N>,
+    new_program: &Program<N>,
+    consensus_version: ConsensusVersion,
+) -> Result<()> {
+    if !remote_program.contains_constructor() {
+        return Ok(());
+    }
+
+    Stack::check_upgrade_is_valid(remote_program, new_program)
+        .and_then(|_| {
+            if consensus_version >= ConsensusVersion::V10 {
+                snarkvm::synthesizer::vm::check_output_register_indices_unchanged(remote_program, new_program)
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(|e| {
+            crate::errors::custom(format!("program '{id}' is not a valid upgrade: {e}"))
+                .with_help(
+                    "Try preserving the original interface and output registers, adding a new function for the changed \
+                    interface, or deploying a new program.",
+                )
+                .into()
+        })
+}
+
 /// Check the tasks to warn the user about any potential issues.
 /// The following properties are checked:
 /// - If the transaction is to be broadcast:
@@ -476,17 +567,20 @@ fn check_tasks_for_warnings<N: Network>(
     endpoint: &str,
     network: NetworkName,
     tasks: &[Task<N>],
+    remote_programs: &[(ProgramID<N>, Program<N>)],
     consensus_version: ConsensusVersion,
     command: &LeoUpgrade,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    for Task { id, program, is_local, .. } in tasks {
+    for Task { id, program, is_local, bytecode_size, .. } in tasks {
         if !is_local || !command.action.broadcast {
             continue;
         }
 
         // Check if the program exists on the network.
-        if let Ok(remote_program) =
+        if let Some((_, remote_program)) = remote_programs.iter().find(|(remote_id, _)| remote_id == id) {
+            push_remote_upgrade_warnings(id, remote_program, program, consensus_version, &mut warnings);
+        } else if let Ok(remote_program) =
             fetch_program_from_network(&id.to_string(), endpoint, network, command.env_override.network_retries)
         {
             // Parse the program.
@@ -497,18 +591,7 @@ fn check_tasks_for_warnings<N: Network>(
                     continue;
                 }
             };
-            // Check if the program is a valid upgrade.
-            if remote_program.contains_constructor() {
-                if let Err(e) = Stack::check_upgrade_is_valid(&remote_program, program) {
-                    warnings.push(format!(
-                        "The program '{id}' is not a valid upgrade. The upgrade will likely fail. Error: {e}",
-                    ));
-                }
-            } else if consensus_version >= ConsensusVersion::V8 {
-                warnings.push(format!("The program '{id}' can only ever be upgraded once and its contents cannot be changed. Otherwise, the upgrade will likely fail."));
-            } else {
-                warnings.push(format!("The program '{id}' does not have a constructor and is not eligible for a one-time upgrade (>= `ConsensusVersion::V8`). The upgrade will likely fail."));
-            }
+            push_remote_upgrade_warnings(id, &remote_program, program, consensus_version, &mut warnings);
         } else {
             warnings.push(format!("The program '{id}' does not exist on the network. The upgrade will likely fail.",));
         }
@@ -535,9 +618,25 @@ fn check_tasks_for_warnings<N: Network>(
         if consensus_version < ConsensusVersion::V15 && program.contains_v15_syntax() {
             warnings.push(format!("The program '{id}' uses V15 features (e.g., `view fn`) but the consensus version is less than V15. The upgrade will likely fail"));
         }
+        // Check if the program uses V16 features (e.g., `Program::function_checksum`).
+        if consensus_version < ConsensusVersion::V16 && program.contains_v16_syntax() {
+            warnings.push(format!("The program '{id}' uses V16 features (e.g., `Program::function_checksum`) but the consensus version is less than V16. The upgrade will likely fail"));
+        }
         // Check if the program contains a constructor.
         if consensus_version >= ConsensusVersion::V9 && !program.contains_constructor() {
             warnings.push(format!("The program '{id}' does not contain a constructor. The upgrade will likely fail",));
+        }
+        // An upgrade redeploys bytecode, so it must fit the target version's size limit.
+        let max_size = max_program_size_for_consensus_version::<N>(consensus_version);
+        if *bytecode_size > max_size {
+            warnings.push(format!(
+                "The program '{id}' is {:.2} KB, exceeding the {:.2} KB limit for consensus version {}. The upgrade will likely fail.",
+                *bytecode_size as f64 / 1024.0,
+                max_size as f64 / 1024.0,
+                consensus_version as u8,
+            ));
+        } else if let (_, _, Some(msg)) = format_program_size(*bytecode_size, max_size) {
+            warnings.push(format!("The program '{id}' is {msg}."));
         }
         // Check for a consensus version mismatch.
         if let Err(e) =
@@ -549,6 +648,25 @@ fn check_tasks_for_warnings<N: Network>(
     warnings
 }
 
+fn push_remote_upgrade_warnings<N: Network>(
+    id: &ProgramID<N>,
+    remote_program: &Program<N>,
+    program: &Program<N>,
+    consensus_version: ConsensusVersion,
+    warnings: &mut Vec<String>,
+) {
+    // Check if the program is a valid upgrade.
+    if remote_program.contains_constructor() {
+        if let Err(e) = reject_invalid_upgrade(id, remote_program, program, consensus_version) {
+            warnings.push(e.to_string());
+        }
+    } else if consensus_version >= ConsensusVersion::V8 {
+        warnings.push(format!("The program '{id}' can only ever be upgraded once and its contents cannot be changed. Otherwise, the upgrade will likely fail."));
+    } else {
+        warnings.push(format!("The program '{id}' does not have a constructor and is not eligible for a one-time upgrade (>= `ConsensusVersion::V8`). The upgrade will likely fail."));
+    }
+}
+
 // Convert the `LeoUpgrade` into a `LeoDeploy` command.
 impl From<&LeoUpgrade> for LeoDeploy {
     fn from(upgrade: &LeoUpgrade) -> Self {
@@ -556,10 +674,163 @@ impl From<&LeoUpgrade> for LeoDeploy {
             fee_options: upgrade.fee_options.clone(),
             action: upgrade.action.clone(),
             env_override: upgrade.env_override.clone(),
+            key_override: upgrade.key_override.clone(),
+            consensus_override: upgrade.consensus_override.clone(),
             extra: upgrade.extra.clone(),
             skip: upgrade.skip.clone(),
+            rename: None,
             build_options: upgrade.build_options.clone(),
             skip_deploy_certificate: upgrade.skip_deploy_certificate,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snarkvm::prelude::TestnetV0;
+
+    fn parse_program(source: &str) -> Program<TestnetV0> {
+        Program::<TestnetV0>::from_str(source).unwrap()
+    }
+
+    #[test]
+    fn rejects_upgrade_that_changes_record_output_register() {
+        let original = parse_program(
+            r"program upgrade_check.aleo;
+
+record Token:
+    owner as address.private;
+    amount as u64.private;
+
+function mint:
+    input r0 as address.private;
+    input r1 as u64.private;
+    cast r0 r1 into r2 as Token.record;
+    output r2 as Token.record;
+
+constructor:
+    assert.eq edition 0u16;
+",
+        );
+        let changed_output_register = parse_program(
+            r"program upgrade_check.aleo;
+
+record Token:
+    owner as address.private;
+    amount as u64.private;
+
+function mint:
+    input r0 as address.private;
+    input r1 as u64.private;
+    add r1 0u64 into r2;
+    cast r0 r2 into r3 as Token.record;
+    output r3 as Token.record;
+
+constructor:
+    assert.eq edition 0u16;
+",
+        );
+        let id = original.id();
+
+        let error = reject_invalid_upgrade(id, &original, &changed_output_register, ConsensusVersion::V10)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("not a valid upgrade"));
+        assert!(error.contains("output register"));
+    }
+
+    #[test]
+    fn accepts_upgrade_that_preserves_record_output_register() {
+        let original = parse_program(
+            r"program upgrade_check.aleo;
+
+record Token:
+    owner as address.private;
+    amount as u64.private;
+
+function mint:
+    input r0 as address.private;
+    input r1 as u64.private;
+    cast r0 r1 into r2 as Token.record;
+    output r2 as Token.record;
+
+constructor:
+    assert.eq edition 0u16;
+",
+        );
+        let same_interface = parse_program(
+            r"program upgrade_check.aleo;
+
+record Token:
+    owner as address.private;
+    amount as u64.private;
+
+function mint:
+    input r0 as address.private;
+    input r1 as u64.private;
+    add r1 1u64 into r3;
+    cast r0 r1 into r2 as Token.record;
+    output r2 as Token.record;
+
+constructor:
+    assert.eq edition 0u16;
+",
+        );
+
+        assert!(reject_invalid_upgrade(original.id(), &original, &same_interface, ConsensusVersion::V10).is_ok());
+    }
+
+    #[test]
+    fn warns_for_upgrade_that_changes_record_output_register() {
+        let original = parse_program(
+            r"program upgrade_check.aleo;
+
+record Token:
+    owner as address.private;
+    amount as u64.private;
+
+function mint:
+    input r0 as address.private;
+    input r1 as u64.private;
+    cast r0 r1 into r2 as Token.record;
+    output r2 as Token.record;
+
+constructor:
+    assert.eq edition 0u16;
+",
+        );
+        let changed_output_register = parse_program(
+            r"program upgrade_check.aleo;
+
+record Token:
+    owner as address.private;
+    amount as u64.private;
+
+function mint:
+    input r0 as address.private;
+    input r1 as u64.private;
+    add r1 0u64 into r2;
+    cast r0 r2 into r3 as Token.record;
+    output r3 as Token.record;
+
+constructor:
+    assert.eq edition 0u16;
+",
+        );
+        let mut warnings = Vec::new();
+
+        push_remote_upgrade_warnings(
+            original.id(),
+            &original,
+            &changed_output_register,
+            ConsensusVersion::V10,
+            &mut warnings,
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("not a valid upgrade"));
+        assert!(warnings[0].contains("Try preserving the original interface and output registers"));
     }
 }

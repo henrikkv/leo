@@ -9,9 +9,12 @@ program credits.aleo {
         let f: Final = final { finalize(); };
         return (cred, f);
     }
+
+    @noupgrade
+    constructor() {}
 }
 
-final fn finalize() {
+export final fn finalize() {
     assert_eq(1u8, 1u8);
 }
 

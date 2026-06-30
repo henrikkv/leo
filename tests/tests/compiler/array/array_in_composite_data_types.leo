@@ -1,4 +1,4 @@
-struct bar {
+export struct bar {
     data: [u8; 8],
 }
 
@@ -15,4 +15,7 @@ program test.aleo {
             floo { owner: self.signer, data: [1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8] },
         );
     }
+
+    @noupgrade
+    constructor() {}
 }

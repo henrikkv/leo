@@ -7,17 +7,20 @@ program test.aleo {
     mapping tokens: address => Token;
 
     mapping foo: Bar => Baz;
+
+    @noupgrade
+    constructor() {}
 }
 
-struct Token {
+export struct Token {
     Owner: address,
     balance: u128,
 }
 
-struct Bar {
+export struct Bar {
     a: u128,
 }
 
-struct Baz {
+export struct Baz {
     a: u128,
 }
