@@ -13,14 +13,14 @@
             "is_exported": true,
             "place": {
               "name": "UNIT",
-              "id": 84210
+              "id": 84297
             },
             "type_": {
               "Integer": "U32"
             },
             "value": {
               "Literal": {
-                "id": 84211,
+                "id": 84298,
                 "variant": {
                   "Integer": [
                     "U32",
@@ -29,7 +29,7 @@
                 }
               }
             },
-            "id": 84209
+            "id": 84296
           }
         ]
       ],
@@ -43,20 +43,20 @@
             "variant": "Fn",
             "identifier": {
               "name": "increment",
-              "id": 84213
+              "id": 84300
             },
             "const_parameters": [],
             "input": [
               {
                 "identifier": {
                   "name": "x",
-                  "id": 84215
+                  "id": 84302
                 },
                 "mode": "None",
                 "type_": {
                   "Integer": "U32"
                 },
-                "id": 84214
+                "id": 84301
               }
             ],
             "output": [
@@ -65,7 +65,7 @@
                 "type_": {
                   "Integer": "U32"
                 },
-                "id": 84216
+                "id": 84303
               }
             ],
             "output_type": {
@@ -83,12 +83,12 @@
                             "qualifier": [],
                             "identifier": {
                               "name": "x",
-                              "id": 84221
+                              "id": 84308
                             },
                             "target": {
                               "Local": "x"
                             },
-                            "id": 84222
+                            "id": 84309
                           }
                         },
                         "right": {
@@ -97,7 +97,7 @@
                             "qualifier": [],
                             "identifier": {
                               "name": "UNIT",
-                              "id": 84224
+                              "id": 84311
                             },
                             "target": {
                               "Global": {
@@ -108,20 +108,20 @@
                                 ]
                               }
                             },
-                            "id": 84225
+                            "id": 84312
                           }
                         },
                         "op": "Add",
-                        "id": 84220
+                        "id": 84307
                       }
                     },
-                    "id": 84219
+                    "id": 84306
                   }
                 }
               ],
-              "id": 84217
+              "id": 84304
             },
-            "id": 84212
+            "id": 84299
           }
         ]
       ],
@@ -139,31 +139,31 @@
         "variant": "Fn",
         "identifier": {
           "name": "scale",
-          "id": 84193
+          "id": 84280
         },
         "const_parameters": [],
         "input": [
           {
             "identifier": {
               "name": "x",
-              "id": 84195
+              "id": 84282
             },
             "mode": "None",
             "type_": {
               "Integer": "U32"
             },
-            "id": 84194
+            "id": 84281
           },
           {
             "identifier": {
               "name": "factor",
-              "id": 84197
+              "id": 84284
             },
             "mode": "None",
             "type_": {
               "Integer": "U32"
             },
-            "id": 84196
+            "id": 84283
           }
         ],
         "output": [
@@ -172,7 +172,7 @@
             "type_": {
               "Integer": "U32"
             },
-            "id": 84198
+            "id": 84285
           }
         ],
         "output_type": {
@@ -190,12 +190,12 @@
                         "qualifier": [],
                         "identifier": {
                           "name": "x",
-                          "id": 84203
+                          "id": 84290
                         },
                         "target": {
                           "Local": "x"
                         },
-                        "id": 84204
+                        "id": 84291
                       }
                     },
                     "right": {
@@ -204,25 +204,25 @@
                         "qualifier": [],
                         "identifier": {
                           "name": "factor",
-                          "id": 84206
+                          "id": 84293
                         },
                         "target": {
                           "Local": "factor"
                         },
-                        "id": 84207
+                        "id": 84294
                       }
                     },
                     "op": "Mul",
-                    "id": 84202
+                    "id": 84289
                   }
                 },
-                "id": 84201
+                "id": 84288
               }
             }
           ],
-          "id": 84199
+          "id": 84286
         },
-        "id": 84192
+        "id": 84279
       }
     ]
   ],
@@ -436648,11 +436648,20 @@
                   "caller",
                   {
                     "is_exported": true,
-                    "annotations": [],
+                    "annotations": [
+                      {
+                        "identifier": {
+                          "name": "_caller_annotation",
+                          "id": 84112
+                        },
+                        "map": {},
+                        "id": 84111
+                      }
+                    ],
                     "variant": "Fn",
                     "identifier": {
                       "name": "caller",
-                      "id": 84111
+                      "id": 84113
                     },
                     "const_parameters": [],
                     "input": [],
@@ -436660,7 +436669,7 @@
                       {
                         "mode": "None",
                         "type_": "Address",
-                        "id": 84112
+                        "id": 84114
                       }
                     ],
                     "output_type": "Address",
@@ -436675,14 +436684,14 @@
                                 "input_types": [],
                                 "return_types": [],
                                 "arguments": [],
-                                "id": 84116
+                                "id": 84118
                               }
                             },
-                            "id": 84115
+                            "id": 84117
                           }
                         }
                       ],
-                      "id": 84113
+                      "id": 84115
                     },
                     "id": 84110
                   }
@@ -436695,7 +436704,7 @@
                     "variant": "Fn",
                     "identifier": {
                       "name": "signer",
-                      "id": 84120
+                      "id": 84122
                     },
                     "const_parameters": [],
                     "input": [],
@@ -436703,7 +436712,7 @@
                       {
                         "mode": "None",
                         "type_": "Address",
-                        "id": 84121
+                        "id": 84123
                       }
                     ],
                     "output_type": "Address",
@@ -436718,16 +436727,16 @@
                                 "input_types": [],
                                 "return_types": [],
                                 "arguments": [],
-                                "id": 84125
+                                "id": 84127
                               }
                             },
-                            "id": 84124
+                            "id": 84126
                           }
                         }
                       ],
-                      "id": 84122
+                      "id": 84124
                     },
-                    "id": 84119
+                    "id": 84121
                   }
                 ],
                 [
@@ -436735,10 +436744,10 @@
                   {
                     "is_exported": true,
                     "annotations": [],
-                    "variant": "FinalFn",
+                    "variant": "Fn",
                     "identifier": {
                       "name": "id",
-                      "id": 84129
+                      "id": 84131
                     },
                     "const_parameters": [],
                     "input": [],
@@ -436746,7 +436755,7 @@
                       {
                         "mode": "None",
                         "type_": "Address",
-                        "id": 84130
+                        "id": 84132
                       }
                     ],
                     "output_type": "Address",
@@ -436761,27 +436770,36 @@
                                 "input_types": [],
                                 "return_types": [],
                                 "arguments": [],
-                                "id": 84134
+                                "id": 84136
                               }
                             },
-                            "id": 84133
+                            "id": 84135
                           }
                         }
                       ],
-                      "id": 84131
+                      "id": 84133
                     },
-                    "id": 84128
+                    "id": 84130
                   }
                 ],
                 [
                   "checksum",
                   {
                     "is_exported": true,
-                    "annotations": [],
-                    "variant": "FinalFn",
+                    "annotations": [
+                      {
+                        "identifier": {
+                          "name": "_onchain_context",
+                          "id": 84141
+                        },
+                        "map": {},
+                        "id": 84140
+                      }
+                    ],
+                    "variant": "Fn",
                     "identifier": {
                       "name": "checksum",
-                      "id": 84138
+                      "id": 84142
                     },
                     "const_parameters": [],
                     "input": [],
@@ -436795,7 +436813,7 @@
                             },
                             "length": {
                               "Literal": {
-                                "id": 84139,
+                                "id": 84143,
                                 "variant": {
                                   "Unsuffixed": "32"
                                 }
@@ -436803,7 +436821,7 @@
                             }
                           }
                         },
-                        "id": 84140
+                        "id": 84144
                       }
                     ],
                     "output_type": {
@@ -436813,7 +436831,7 @@
                         },
                         "length": {
                           "Literal": {
-                            "id": 84139,
+                            "id": 84143,
                             "variant": {
                               "Unsuffixed": "32"
                             }
@@ -436832,27 +436850,36 @@
                                 "input_types": [],
                                 "return_types": [],
                                 "arguments": [],
-                                "id": 84144
+                                "id": 84148
                               }
                             },
-                            "id": 84143
+                            "id": 84147
                           }
                         }
                       ],
-                      "id": 84141
+                      "id": 84145
                     },
-                    "id": 84137
+                    "id": 84139
                   }
                 ],
                 [
                   "edition",
                   {
                     "is_exported": true,
-                    "annotations": [],
-                    "variant": "FinalFn",
+                    "annotations": [
+                      {
+                        "identifier": {
+                          "name": "_onchain_context",
+                          "id": 84153
+                        },
+                        "map": {},
+                        "id": 84152
+                      }
+                    ],
+                    "variant": "Fn",
                     "identifier": {
                       "name": "edition",
-                      "id": 84148
+                      "id": 84154
                     },
                     "const_parameters": [],
                     "input": [],
@@ -436862,7 +436889,7 @@
                         "type_": {
                           "Integer": "U16"
                         },
-                        "id": 84149
+                        "id": 84155
                       }
                     ],
                     "output_type": {
@@ -436879,27 +436906,36 @@
                                 "input_types": [],
                                 "return_types": [],
                                 "arguments": [],
-                                "id": 84153
+                                "id": 84159
                               }
                             },
-                            "id": 84152
+                            "id": 84158
                           }
                         }
                       ],
-                      "id": 84150
+                      "id": 84156
                     },
-                    "id": 84147
+                    "id": 84151
                   }
                 ],
                 [
                   "program_owner",
                   {
                     "is_exported": true,
-                    "annotations": [],
-                    "variant": "FinalFn",
+                    "annotations": [
+                      {
+                        "identifier": {
+                          "name": "_onchain_context",
+                          "id": 84164
+                        },
+                        "map": {},
+                        "id": 84163
+                      }
+                    ],
+                    "variant": "Fn",
                     "identifier": {
                       "name": "program_owner",
-                      "id": 84157
+                      "id": 84165
                     },
                     "const_parameters": [],
                     "input": [],
@@ -436907,7 +436943,7 @@
                       {
                         "mode": "None",
                         "type_": "Address",
-                        "id": 84158
+                        "id": 84166
                       }
                     ],
                     "output_type": "Address",
@@ -436922,27 +436958,36 @@
                                 "input_types": [],
                                 "return_types": [],
                                 "arguments": [],
-                                "id": 84162
+                                "id": 84170
                               }
                             },
-                            "id": 84161
+                            "id": 84169
                           }
                         }
                       ],
-                      "id": 84159
+                      "id": 84167
                     },
-                    "id": 84156
+                    "id": 84162
                   }
                 ],
                 [
                   "block_height",
                   {
                     "is_exported": true,
-                    "annotations": [],
-                    "variant": "FinalFn",
+                    "annotations": [
+                      {
+                        "identifier": {
+                          "name": "_onchain_context",
+                          "id": 84175
+                        },
+                        "map": {},
+                        "id": 84174
+                      }
+                    ],
+                    "variant": "Fn",
                     "identifier": {
                       "name": "block_height",
-                      "id": 84166
+                      "id": 84176
                     },
                     "const_parameters": [],
                     "input": [],
@@ -436952,7 +436997,7 @@
                         "type_": {
                           "Integer": "U32"
                         },
-                        "id": 84167
+                        "id": 84177
                       }
                     ],
                     "output_type": {
@@ -436969,27 +437014,36 @@
                                 "input_types": [],
                                 "return_types": [],
                                 "arguments": [],
-                                "id": 84171
+                                "id": 84181
                               }
                             },
-                            "id": 84170
+                            "id": 84180
                           }
                         }
                       ],
-                      "id": 84168
+                      "id": 84178
                     },
-                    "id": 84165
+                    "id": 84173
                   }
                 ],
                 [
                   "block_timestamp",
                   {
                     "is_exported": true,
-                    "annotations": [],
-                    "variant": "FinalFn",
+                    "annotations": [
+                      {
+                        "identifier": {
+                          "name": "_onchain_context",
+                          "id": 84186
+                        },
+                        "map": {},
+                        "id": 84185
+                      }
+                    ],
+                    "variant": "Fn",
                     "identifier": {
                       "name": "block_timestamp",
-                      "id": 84175
+                      "id": 84187
                     },
                     "const_parameters": [],
                     "input": [],
@@ -436999,7 +437053,7 @@
                         "type_": {
                           "Integer": "I64"
                         },
-                        "id": 84176
+                        "id": 84188
                       }
                     ],
                     "output_type": {
@@ -437016,27 +437070,36 @@
                                 "input_types": [],
                                 "return_types": [],
                                 "arguments": [],
-                                "id": 84180
+                                "id": 84192
                               }
                             },
-                            "id": 84179
+                            "id": 84191
                           }
                         }
                       ],
-                      "id": 84177
+                      "id": 84189
                     },
-                    "id": 84174
+                    "id": 84184
                   }
                 ],
                 [
                   "network_id",
                   {
                     "is_exported": true,
-                    "annotations": [],
-                    "variant": "FinalFn",
+                    "annotations": [
+                      {
+                        "identifier": {
+                          "name": "_onchain_context",
+                          "id": 84197
+                        },
+                        "map": {},
+                        "id": 84196
+                      }
+                    ],
+                    "variant": "Fn",
                     "identifier": {
                       "name": "network_id",
-                      "id": 84184
+                      "id": 84198
                     },
                     "const_parameters": [],
                     "input": [],
@@ -437046,7 +437109,7 @@
                         "type_": {
                           "Integer": "U16"
                         },
-                        "id": 84185
+                        "id": 84199
                       }
                     ],
                     "output_type": {
@@ -437063,16 +437126,421 @@
                                 "input_types": [],
                                 "return_types": [],
                                 "arguments": [],
-                                "id": 84189
+                                "id": 84203
                               }
                             },
-                            "id": 84188
+                            "id": 84202
                           }
                         }
                       ],
-                      "id": 84186
+                      "id": 84200
                     },
-                    "id": 84183
+                    "id": 84195
+                  }
+                ]
+              ],
+              "interfaces": []
+            },
+            "prog": {
+              "unit_name": "std",
+              "path": [
+                "prog"
+              ],
+              "consts": [],
+              "composites": [],
+              "functions": [
+                [
+                  "checksum",
+                  {
+                    "is_exported": true,
+                    "annotations": [
+                      {
+                        "identifier": {
+                          "name": "_program_id_arg",
+                          "id": 84208
+                        },
+                        "map": {},
+                        "id": 84207
+                      }
+                    ],
+                    "variant": "FinalFn",
+                    "identifier": {
+                      "name": "checksum",
+                      "id": 84209
+                    },
+                    "const_parameters": [
+                      {
+                        "identifier": {
+                          "name": "PROG",
+                          "id": 84211
+                        },
+                        "type_": "Address",
+                        "id": 84210
+                      }
+                    ],
+                    "input": [],
+                    "output": [
+                      {
+                        "mode": "None",
+                        "type_": {
+                          "Array": {
+                            "element_type": {
+                              "Integer": "U8"
+                            },
+                            "length": {
+                              "Literal": {
+                                "id": 84212,
+                                "variant": {
+                                  "Unsuffixed": "32"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "id": 84213
+                      }
+                    ],
+                    "output_type": {
+                      "Array": {
+                        "element_type": {
+                          "Integer": "U8"
+                        },
+                        "length": {
+                          "Literal": {
+                            "id": 84212,
+                            "variant": {
+                              "Unsuffixed": "32"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "block": {
+                      "statements": [
+                        {
+                          "Return": {
+                            "expression": {
+                              "Intrinsic": {
+                                "name": "_program_checksum",
+                                "type_parameters": [],
+                                "input_types": [],
+                                "return_types": [],
+                                "arguments": [
+                                  {
+                                    "Path": {
+                                      "user_program": null,
+                                      "qualifier": [],
+                                      "identifier": {
+                                        "name": "PROG",
+                                        "id": 84220
+                                      },
+                                      "target": {
+                                        "Local": "PROG"
+                                      },
+                                      "id": 84221
+                                    }
+                                  }
+                                ],
+                                "id": 84217
+                              }
+                            },
+                            "id": 84216
+                          }
+                        }
+                      ],
+                      "id": 84214
+                    },
+                    "id": 84206
+                  }
+                ],
+                [
+                  "edition",
+                  {
+                    "is_exported": true,
+                    "annotations": [
+                      {
+                        "identifier": {
+                          "name": "_program_id_arg",
+                          "id": 84225
+                        },
+                        "map": {},
+                        "id": 84224
+                      }
+                    ],
+                    "variant": "FinalFn",
+                    "identifier": {
+                      "name": "edition",
+                      "id": 84226
+                    },
+                    "const_parameters": [
+                      {
+                        "identifier": {
+                          "name": "PROG",
+                          "id": 84228
+                        },
+                        "type_": "Address",
+                        "id": 84227
+                      }
+                    ],
+                    "input": [],
+                    "output": [
+                      {
+                        "mode": "None",
+                        "type_": {
+                          "Integer": "U16"
+                        },
+                        "id": 84229
+                      }
+                    ],
+                    "output_type": {
+                      "Integer": "U16"
+                    },
+                    "block": {
+                      "statements": [
+                        {
+                          "Return": {
+                            "expression": {
+                              "Intrinsic": {
+                                "name": "_program_edition",
+                                "type_parameters": [],
+                                "input_types": [],
+                                "return_types": [],
+                                "arguments": [
+                                  {
+                                    "Path": {
+                                      "user_program": null,
+                                      "qualifier": [],
+                                      "identifier": {
+                                        "name": "PROG",
+                                        "id": 84236
+                                      },
+                                      "target": {
+                                        "Local": "PROG"
+                                      },
+                                      "id": 84237
+                                    }
+                                  }
+                                ],
+                                "id": 84233
+                              }
+                            },
+                            "id": 84232
+                          }
+                        }
+                      ],
+                      "id": 84230
+                    },
+                    "id": 84223
+                  }
+                ],
+                [
+                  "program_owner",
+                  {
+                    "is_exported": true,
+                    "annotations": [
+                      {
+                        "identifier": {
+                          "name": "_program_id_arg",
+                          "id": 84241
+                        },
+                        "map": {},
+                        "id": 84240
+                      }
+                    ],
+                    "variant": "FinalFn",
+                    "identifier": {
+                      "name": "program_owner",
+                      "id": 84242
+                    },
+                    "const_parameters": [
+                      {
+                        "identifier": {
+                          "name": "PROG",
+                          "id": 84244
+                        },
+                        "type_": "Address",
+                        "id": 84243
+                      }
+                    ],
+                    "input": [],
+                    "output": [
+                      {
+                        "mode": "None",
+                        "type_": "Address",
+                        "id": 84245
+                      }
+                    ],
+                    "output_type": "Address",
+                    "block": {
+                      "statements": [
+                        {
+                          "Return": {
+                            "expression": {
+                              "Intrinsic": {
+                                "name": "_program_owner",
+                                "type_parameters": [],
+                                "input_types": [],
+                                "return_types": [],
+                                "arguments": [
+                                  {
+                                    "Path": {
+                                      "user_program": null,
+                                      "qualifier": [],
+                                      "identifier": {
+                                        "name": "PROG",
+                                        "id": 84252
+                                      },
+                                      "target": {
+                                        "Local": "PROG"
+                                      },
+                                      "id": 84253
+                                    }
+                                  }
+                                ],
+                                "id": 84249
+                              }
+                            },
+                            "id": 84248
+                          }
+                        }
+                      ],
+                      "id": 84246
+                    },
+                    "id": 84239
+                  }
+                ],
+                [
+                  "function_checksum",
+                  {
+                    "is_exported": true,
+                    "annotations": [
+                      {
+                        "identifier": {
+                          "name": "_program_id_arg",
+                          "id": 84257
+                        },
+                        "map": {},
+                        "id": 84256
+                      },
+                      {
+                        "identifier": {
+                          "name": "_callable_function_arg",
+                          "id": 84259
+                        },
+                        "map": {},
+                        "id": 84258
+                      }
+                    ],
+                    "variant": "FinalFn",
+                    "identifier": {
+                      "name": "function_checksum",
+                      "id": 84260
+                    },
+                    "const_parameters": [
+                      {
+                        "identifier": {
+                          "name": "PROG",
+                          "id": 84262
+                        },
+                        "type_": "Address",
+                        "id": 84261
+                      },
+                      {
+                        "identifier": {
+                          "name": "FN_NAME",
+                          "id": 84264
+                        },
+                        "type_": "Identifier",
+                        "id": 84263
+                      }
+                    ],
+                    "input": [],
+                    "output": [
+                      {
+                        "mode": "None",
+                        "type_": {
+                          "Array": {
+                            "element_type": {
+                              "Integer": "U8"
+                            },
+                            "length": {
+                              "Literal": {
+                                "id": 84265,
+                                "variant": {
+                                  "Unsuffixed": "32"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "id": 84266
+                      }
+                    ],
+                    "output_type": {
+                      "Array": {
+                        "element_type": {
+                          "Integer": "U8"
+                        },
+                        "length": {
+                          "Literal": {
+                            "id": 84265,
+                            "variant": {
+                              "Unsuffixed": "32"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "block": {
+                      "statements": [
+                        {
+                          "Return": {
+                            "expression": {
+                              "Intrinsic": {
+                                "name": "_function_checksum",
+                                "type_parameters": [],
+                                "input_types": [],
+                                "return_types": [],
+                                "arguments": [
+                                  {
+                                    "Path": {
+                                      "user_program": null,
+                                      "qualifier": [],
+                                      "identifier": {
+                                        "name": "PROG",
+                                        "id": 84273
+                                      },
+                                      "target": {
+                                        "Local": "PROG"
+                                      },
+                                      "id": 84274
+                                    }
+                                  },
+                                  {
+                                    "Path": {
+                                      "user_program": null,
+                                      "qualifier": [],
+                                      "identifier": {
+                                        "name": "FN_NAME",
+                                        "id": 84276
+                                      },
+                                      "target": {
+                                        "Local": "FN_NAME"
+                                      },
+                                      "id": 84277
+                                    }
+                                  }
+                                ],
+                                "id": 84270
+                              }
+                            },
+                            "id": 84269
+                          }
+                        }
+                      ],
+                      "id": 84267
+                    },
+                    "id": 84255
                   }
                 ]
               ],
