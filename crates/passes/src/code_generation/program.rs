@@ -222,6 +222,9 @@ impl<'a> CodeGeneratingVisitor<'a> {
         self.variable_mapping.insert(sym::block, AleoExpr::Reg(AleoReg::Block));
         self.variable_mapping.insert(sym::network, AleoExpr::Reg(AleoReg::Network));
         self.current_function = Some(function);
+        if self.debug_info {
+            self.debug_spans = Some(Vec::new());
+        }
 
         // Construct the header of the function.
         // If a function is an entry point, generate an Aleo `function`,
@@ -311,6 +314,9 @@ impl<'a> CodeGeneratingVisitor<'a> {
             // invalid in Aleo; insert a no-op `assert.eq true true` so the body parses. View
             // bodies accept zero commands at the snarkVM level, so they don't need this.
             statements.insert(0, AleoStmt::AssertEq(AleoExpr::Bool(true), AleoExpr::Bool(true)));
+            if let Some(spans) = self.debug_spans.as_mut() {
+                spans.insert(0, None);
+            }
         }
 
         // Check the write command limit for finalize blocks.
@@ -333,16 +339,29 @@ impl<'a> CodeGeneratingVisitor<'a> {
             }
         }
 
+        let debug_spans = self.debug_spans.take();
+
         match function.variant {
             Variant::FinalFn => None,
-            Variant::EntryPoint => {
-                Some(AleoFunctional::Function(AleoFunction { name: function_name, inputs, statements, finalize: None })) // finalize added by caller
+            Variant::EntryPoint => Some(AleoFunctional::Function(AleoFunction {
+                name: function_name,
+                inputs,
+                statements,
+                finalize: None,
+                debug_spans,
+            })),
+            Variant::Fn => {
+                Some(AleoFunctional::Closure(AleoClosure { name: function_name, inputs, statements, debug_spans }))
             }
-            Variant::Fn => Some(AleoFunctional::Closure(AleoClosure { name: function_name, inputs, statements })),
-            Variant::Finalize => {
-                Some(AleoFunctional::Finalize(AleoFinalize { caller_name: function_name, inputs, statements }))
+            Variant::Finalize => Some(AleoFunctional::Finalize(AleoFinalize {
+                caller_name: function_name,
+                inputs,
+                statements,
+                debug_spans,
+            })),
+            Variant::View => {
+                Some(AleoFunctional::View(AleoView { name: function_name, inputs, statements, debug_spans }))
             }
-            Variant::View => Some(AleoFunctional::View(AleoView { name: function_name, inputs, statements })),
         }
     }
 
@@ -361,6 +380,9 @@ impl<'a> CodeGeneratingVisitor<'a> {
         self.variable_mapping.insert(sym::SelfLower, AleoExpr::Reg(AleoReg::Self_));
         self.variable_mapping.insert(sym::block, AleoExpr::Reg(AleoReg::Block));
         self.variable_mapping.insert(sym::network, AleoExpr::Reg(AleoReg::Network));
+        if self.debug_info {
+            self.debug_spans = Some(Vec::new());
+        }
 
         // Save the span before the local `constructor` variable shadows the parameter.
         let span = constructor.span;
@@ -372,13 +394,14 @@ impl<'a> CodeGeneratingVisitor<'a> {
 
         // Construct the constructor.
         // If the constructor is one of the standard constructors, use the hardcoded defaults.
-        let constructor = match &upgrade_variant {
+        let mut constructor = match &upgrade_variant {
             // This is the expected snarkVM constructor bytecode for a program that is only upgradable by a fixed admin.
             UpgradeVariant::Admin { address } => AleoConstructor {
                 statements: vec![AleoStmt::AssertEq(
                     AleoExpr::RawName("program_owner".to_string()),
                     AleoExpr::RawName(address.to_string()),
                 )],
+                debug_spans: None,
             },
 
             UpgradeVariant::Checksum { mapping, key, .. } => {
@@ -405,16 +428,25 @@ impl<'a> CodeGeneratingVisitor<'a> {
                         AleoStmt::AssertEq(AleoExpr::RawName("checksum".to_string()), AleoExpr::Reg(AleoReg::R(0))),
                         AleoStmt::Position("end".to_string()),
                     ],
+                    debug_spans: None,
                 }
             }
-            UpgradeVariant::Custom => AleoConstructor { statements: self.visit_block(&constructor.block) },
+            UpgradeVariant::Custom => {
+                AleoConstructor { statements: self.visit_block(&constructor.block), debug_spans: None }
+            }
             UpgradeVariant::NoUpgrade => {
                 // This is the expected snarkVM constructor bytecode for a program that is not upgradable.
                 AleoConstructor {
                     statements: vec![AleoStmt::AssertEq(AleoExpr::RawName("edition".to_string()), AleoExpr::U16(0))],
+                    debug_spans: None,
                 }
             }
         };
+
+        if let Some(mut spans) = self.debug_spans.take() {
+            spans.resize(constructor.statements.len(), None);
+            constructor.debug_spans = Some(spans);
+        }
 
         // Check the write command limit first, giving a precise diagnostic.
         let max_writes = match self.state.network {

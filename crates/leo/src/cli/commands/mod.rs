@@ -32,6 +32,9 @@ pub use clean::LeoClean;
 mod common;
 pub use common::*;
 
+mod debug;
+pub use debug::LeoDebug;
+
 mod deploy;
 pub use deploy::LeoDeploy;
 use deploy::{

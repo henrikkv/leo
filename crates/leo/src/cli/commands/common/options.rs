@@ -48,6 +48,8 @@ pub struct BuildOptions {
     pub checksums: bool,
     #[clap(skip)]
     pub no_std: bool,
+    #[clap(skip)]
+    pub debug_info: bool,
 }
 
 /// Network connection overrides for the `.env` file. Flattened by every command that talks to a

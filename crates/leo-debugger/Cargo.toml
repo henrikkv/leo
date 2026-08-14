@@ -1,0 +1,51 @@
+[package]
+name = "leo-debugger"
+version = "4.4.1"
+description = "TUI debugger for Leo/Aleo programs"
+license = "GPL-3.0"
+edition = "2024"
+
+[dependencies.leo-compiler]
+workspace = true
+
+[dependencies.leo-package]
+workspace = true
+
+[dependencies.leo-passes]
+workspace = true
+
+[dependencies.leo-span]
+workspace = true
+
+[dependencies.snarkvm]
+workspace = true
+
+[dependencies.snarkvm-synthesizer-process]
+workspace = true
+
+[dependencies.serde]
+workspace = true
+
+[dependencies.serde_json]
+workspace = true
+
+[dependencies.crossbeam-channel]
+workspace = true
+
+[dependencies.crossterm]
+workspace = true
+
+[dependencies.ratatui]
+workspace = true
+
+[dependencies.indexmap]
+workspace = true
+
+[dependencies.anyhow]
+workspace = true
+
+[dependencies.aleo-std]
+workspace = true
+
+[dependencies.rand]
+workspace = true

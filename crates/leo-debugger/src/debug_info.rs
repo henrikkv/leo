@@ -14,10 +14,19 @@
 // You should have received a copy of the GNU General Public License
 // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
 
-// NOTE: If compiler passes are made optional, pass preconditions and invariants may not necessarily hold true.
+use leo_passes::ProgramDebugMap;
 
-#[derive(Clone, Debug, Default)]
-pub struct CompilerOptions {
-    pub no_std: bool,
-    pub debug_info: bool,
+use anyhow::{Context, Result};
+
+use std::path::Path;
+
+pub fn load(path: &Path) -> Result<Option<ProgramDebugMap>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let json =
+        std::fs::read_to_string(path).with_context(|| format!("failed to read debug info at {}", path.display()))?;
+    let debug_map =
+        serde_json::from_str(&json).with_context(|| format!("failed to parse debug info at {}", path.display()))?;
+    Ok(Some(debug_map))
 }

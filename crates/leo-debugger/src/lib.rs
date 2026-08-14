@@ -14,10 +14,14 @@
 // You should have received a copy of the GNU General Public License
 // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
 
-// NOTE: If compiler passes are made optional, pass preconditions and invariants may not necessarily hold true.
+pub mod breakpoints;
+pub mod debug_info;
+pub mod hook;
+pub mod session;
+pub mod tui;
 
-#[derive(Clone, Debug, Default)]
-pub struct CompilerOptions {
-    pub no_std: bool,
-    pub debug_info: bool,
-}
+pub use hook::{Context, DebugCommand, DebugEvent, HookState, Phase, SourceLoc};
+pub use session::{ProgramSource, Session, SessionConfig};
+
+#[cfg(test)]
+mod tests;

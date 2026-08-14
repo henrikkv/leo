@@ -333,9 +333,14 @@ impl FlatteningVisitor<'_> {
         // If the list of returns is not empty, then fold them into a single return statement.
         if !returns.is_empty() {
             let mut return_expressions = Vec::with_capacity(returns.len());
+            let mut span = None;
 
             // Aggregate the return expressions and finalize arguments and their respective guards.
             for (guard, return_statement) in returns {
+                span = Some(match span {
+                    Some(span) => span + return_statement.span,
+                    None => return_statement.span,
+                });
                 return_expressions.push((guard.clone(), return_statement.expression));
             }
 
@@ -347,7 +352,8 @@ impl FlatteningVisitor<'_> {
 
             // Add the `ReturnStatement` to the end of the block.
             block.statements.push(
-                ReturnStatement { expression, span: Default::default(), id: self.state.node_builder.next_id() }.into(),
+                ReturnStatement { expression, span: span.unwrap_or_default(), id: self.state.node_builder.next_id() }
+                    .into(),
             );
         }
         // Otherwise, push a dummy return statement to the end of the block.

@@ -407,7 +407,7 @@ impl AstReconstructor for FlatteningVisitor<'_> {
                         place: DefinitionPlace::Multiple(identifiers),
                         type_: None,
                         value,
-                        span: Default::default(),
+                        span: definition.span,
                         id: self.state.node_builder.next_id(),
                     }
                     .into(),

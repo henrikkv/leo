@@ -90,6 +90,8 @@ pub struct CompiledProgram {
     pub bytecode: String,
     /// The ABI describing the program's public interface.
     pub abi: leo_abi::Program,
+    /// Debug info for leo debug.
+    pub debug_info: Option<ProgramDebugMap>,
 }
 
 /// The result of compiling a Leo program.
@@ -550,15 +552,21 @@ impl Compiler {
         // Run the intermediate compiler stages, which also generates ABIs.
         let (primary_abi, import_abis, interfaces) = self.intermediate_passes()?;
         // Run code generation.
-        let generated = self.do_pass::<CodeGenerating>(())?;
-        // Run peephole optimization and serialize to bytecode.
-        let bytecodes = self.do_pass::<PeepholeOptimizing>(generated)?;
+        let generated = self.do_pass::<CodeGenerating>(self.compiler_options.debug_info)?;
+        // Run peephole optimization and serialize to bytecode. Skipped in leo debug.
+        let debug_info = self.compiler_options.debug_info.then(|| extract_debug_info(&generated));
+        let bytecodes = if self.compiler_options.debug_info {
+            generated.into_compiled()
+        } else {
+            self.do_pass::<PeepholeOptimizing>(generated)?
+        };
 
         // Build the primary compiled program.
         let primary = CompiledProgram {
             name: self.unit_name.clone().unwrap(),
             bytecode: bytecodes.primary_bytecode,
             abi: primary_abi,
+            debug_info: debug_info.as_ref().and_then(|d| d.primary.clone()),
         };
 
         // Build compiled programs for imports, looking up ABIs by name.
@@ -567,7 +575,8 @@ impl Compiler {
             .into_iter()
             .map(|bc| {
                 let abi = import_abis.get(&bc.program_name).expect("ABI should exist for all imports").clone();
-                CompiledProgram { name: bc.program_name, bytecode: bc.bytecode, abi }
+                let unit_debug_info = debug_info.as_ref().and_then(|d| d.imports.get(&bc.program_name).cloned());
+                CompiledProgram { name: bc.program_name, bytecode: bc.bytecode, abi, debug_info: unit_debug_info }
             })
             .collect();
 
@@ -899,6 +908,7 @@ impl Compiler {
             Some(CompilerOptions {
                 // avoid infinite recursion
                 no_std: true,
+                debug_info: false,
             }),
             IndexMap::new(),
             network,
@@ -1327,7 +1337,7 @@ mod tests {
     use leo_errors::{BufferEmitter, Handler};
     use leo_span::{Symbol, create_session_if_not_set_then, file_source::InMemoryFileSource, source_map::FileName};
 
-    use std::{path::PathBuf, rc::Rc};
+    use std::{path::PathBuf, rc::Rc, str::FromStr};
 
     use indexmap::IndexMap;
 
@@ -1510,7 +1520,7 @@ mod tests {
                 handler,
                 node_builder,
                 // `no_std` avoids injecting `std` into itself.
-                Some(crate::CompilerOptions { no_std: true }),
+                Some(crate::CompilerOptions { no_std: true, debug_info: false }),
                 IndexMap::new(),
                 NetworkName::TestnetV0,
             );
@@ -1530,6 +1540,74 @@ mod tests {
             assert!(result.is_ok(), "std failed to build: {:?}", result.err());
             let errors = emitter.extract_errs().to_string();
             assert!(errors.is_empty(), "std produced diagnostics:\n{errors}");
+        });
+    }
+
+    #[test]
+    fn test_debug_info_matches_snarkvm_instruction_count() {
+        create_session_if_not_set_then(|_| {
+            let handler = Handler::default();
+            let node_builder = Rc::new(NodeBuilder::default());
+            let mut compiler = Compiler::new(
+                Some("debug_info.aleo".into()),
+                false,
+                handler,
+                node_builder,
+                Some(crate::CompilerOptions { no_std: false, debug_info: true }),
+                IndexMap::new(),
+                NetworkName::TestnetV0,
+            );
+
+            let source = concat!(
+                "program debug_info.aleo {\n",
+                "    mapping counts: u32 => u32;\n",
+                "\n",
+                "    fn pair(x: u32) -> (u32, u32) {\n",
+                "        let y: u32 = x + 1u32;\n",
+                "        return (x, y);\n",
+                "    }\n",
+                "\n",
+                "    fn bump(x: u32) -> Final {\n",
+                "        return final { finalize_bump(x); };\n",
+                "    }\n",
+                "\n",
+                "    @noupgrade\n",
+                "    constructor() {}\n",
+                "}\n",
+                "\n",
+                "export final fn finalize_bump(x: u32) {\n",
+                "    if x > 10u32 {\n",
+                "        Mapping::set(counts, 0u32, x);\n",
+                "    } else {\n",
+                "        Mapping::set(counts, 0u32, x + 1u32);\n",
+                "    }\n",
+                "}\n",
+            );
+            let filename = FileName::Custom("main.leo".into());
+            let modules: Vec<(&str, FileName)> = Vec::new();
+            let compiled = compiler.compile(source, filename, &modules).unwrap();
+
+            let debug_info = compiled.primary.debug_info.unwrap();
+            let program =
+                snarkvm::prelude::Program::<snarkvm::prelude::TestnetV0>::from_str(&compiled.primary.bytecode)
+                    .unwrap();
+
+            for (name, debug_fn) in &debug_info.functions {
+                let identifier = snarkvm::prelude::Identifier::from_str(name).unwrap();
+                let instruction_count = program.get_function(&identifier).unwrap().instructions().len();
+                assert_eq!(debug_fn.instructions.len(), instruction_count);
+            }
+
+            for (name, debug_finalize) in &debug_info.finalizes {
+                let identifier = snarkvm::prelude::Identifier::from_str(name).unwrap();
+                let command_count =
+                    program.get_function(&identifier).unwrap().finalize_logic().unwrap().commands().len();
+                assert_eq!(debug_finalize.instructions.len(), command_count);
+                assert!(debug_finalize.instructions.iter().any(|loc| loc.is_none()));
+            }
+
+            let pair_debug = debug_info.functions.get("pair").unwrap();
+            assert!(pair_debug.instructions.iter().all(|loc| loc.is_some()));
         });
     }
 }

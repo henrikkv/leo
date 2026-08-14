@@ -52,6 +52,7 @@ only_testnet = [ ]
 leo-abi           = { workspace = true, features = [ "aleo-bytecode" ] }
 leo-ast           = { workspace = true }
 leo-compiler      = { workspace = true }
+leo-debugger      = { workspace = true }
 leo-disassembler  = { workspace = true }
 leo-errors        = { workspace = true }
 leo-package       = { workspace = true }

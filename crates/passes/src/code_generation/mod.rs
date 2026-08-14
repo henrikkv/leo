@@ -19,7 +19,10 @@ use crate::{Bytecode, CompiledPrograms, Pass};
 use itertools::Itertools;
 use leo_ast::{Ast, Mode, ProgramId};
 use leo_errors::Result;
+use leo_span::{Span, source_map::FileName, with_session_globals};
 
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
 mod expression;
@@ -77,12 +80,12 @@ impl GeneratedPrograms {
 pub struct CodeGenerating;
 
 impl Pass for CodeGenerating {
-    type Input = ();
+    type Input = bool;
     type Output = GeneratedPrograms;
 
     const NAME: &str = "CodeGenerating";
 
-    fn do_pass(_input: Self::Input, state: &mut crate::CompilerState) -> Result<Self::Output> {
+    fn do_pass(debug_info: Self::Input, state: &mut crate::CompilerState) -> Result<Self::Output> {
         let mut visitor = CodeGeneratingVisitor {
             state,
             next_register: 0,
@@ -102,6 +105,8 @@ impl Pass for CodeGenerating {
             next_label: 0,
             conditional_depth: 0,
             internal_record_inputs: Default::default(),
+            debug_info,
+            debug_spans: None,
         };
 
         Ok(visitor.visit_package())
@@ -160,6 +165,123 @@ impl Display for AleoProgram {
             .join("\n")
             .fmt(f)
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProgramDebugMap {
+    pub source_files: Vec<String>,
+    pub functions: IndexMap<String, DebugInstructions>,
+    pub closures: IndexMap<String, DebugInstructions>,
+    pub finalizes: IndexMap<String, DebugInstructions>,
+    pub views: IndexMap<String, DebugInstructions>,
+    pub constructor: Option<DebugInstructions>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DebugInstructions {
+    pub instructions: Vec<Option<DebugLoc>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct DebugLoc {
+    pub file: usize,
+    pub line: u32,
+    pub col: u32,
+}
+
+#[derive(Default)]
+pub struct CompiledDebugInfo {
+    pub primary: Option<ProgramDebugMap>,
+    pub imports: IndexMap<String, ProgramDebugMap>,
+}
+
+pub fn extract_debug_info(generated: &GeneratedPrograms) -> CompiledDebugInfo {
+    CompiledDebugInfo {
+        primary: generated.primary.as_ref().map(extract_program_debug_info),
+        imports: generated
+            .imports
+            .iter()
+            .map(|(name, program)| (name.clone(), extract_program_debug_info(program)))
+            .collect(),
+    }
+}
+
+fn extract_program_debug_info(program: &AleoProgram) -> ProgramDebugMap {
+    let mut source_files: Vec<String> = Vec::new();
+    let mut map = ProgramDebugMap::default();
+
+    for functional in &program.functions {
+        match functional {
+            AleoFunctional::Closure(c) => {
+                map.closures
+                    .insert(c.name.clone(), to_debug_instructions(&c.statements, &c.debug_spans, &mut source_files));
+            }
+            AleoFunctional::Function(fun) => {
+                map.functions.insert(
+                    fun.name.clone(),
+                    to_debug_instructions(&fun.statements, &fun.debug_spans, &mut source_files),
+                );
+                if let Some(fin) = &fun.finalize {
+                    map.finalizes.insert(
+                        fin.caller_name.clone(),
+                        to_debug_instructions(&fin.statements, &fin.debug_spans, &mut source_files),
+                    );
+                }
+            }
+            AleoFunctional::Finalize(fin) => {
+                map.finalizes.insert(
+                    fin.caller_name.clone(),
+                    to_debug_instructions(&fin.statements, &fin.debug_spans, &mut source_files),
+                );
+            }
+            AleoFunctional::View(v) => {
+                map.views
+                    .insert(v.name.clone(), to_debug_instructions(&v.statements, &v.debug_spans, &mut source_files));
+            }
+        }
+    }
+    if let Some(constructor) = &program.constructor {
+        map.constructor =
+            Some(to_debug_instructions(&constructor.statements, &constructor.debug_spans, &mut source_files));
+    }
+
+    map.source_files = source_files;
+    map
+}
+
+fn to_debug_instructions(
+    statements: &[AleoStmt],
+    spans: &Option<Vec<Option<Span>>>,
+    source_files: &mut Vec<String>,
+) -> DebugInstructions {
+    let empty = Vec::new();
+    let spans = spans.as_ref().unwrap_or(&empty);
+    let instructions = statements
+        .iter()
+        .zip(spans.iter().copied().chain(std::iter::repeat(None)))
+        .filter(|(stmt, _)| !matches!(stmt, AleoStmt::Output(..)))
+        .map(|(_, span)| span.filter(|span| !span.is_dummy()).map(|span| debug_loc(span, source_files)))
+        .collect();
+    DebugInstructions { instructions }
+}
+
+fn debug_loc(span: Span, source_files: &mut Vec<String>) -> DebugLoc {
+    with_session_globals(|s| {
+        let source_file = s.source_map.find_source_file(span.lo).expect("a real Span must resolve to a source file");
+        let (line, col) = source_file.line_col(span.lo);
+        let display = match &source_file.name {
+            FileName::Real(path) => path.display().to_string(),
+            FileName::Custom(name) => name.clone(),
+        };
+        let file = match source_files.iter().position(|f| f == &display) {
+            Some(index) => index,
+            None => {
+                source_files.push(display);
+                source_files.len() - 1
+            }
+        };
+        DebugLoc { file, line: line + 1, col: col + 1 }
+    })
 }
 
 #[derive(Debug)]
@@ -264,6 +386,7 @@ pub struct AleoClosure {
     name: String,
     inputs: Vec<AleoInput>,
     statements: Vec<AleoStmt>,
+    debug_spans: Option<Vec<Option<Span>>>,
 }
 impl Display for AleoClosure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -327,6 +450,7 @@ pub struct AleoView {
     name: String,
     inputs: Vec<AleoInput>,
     statements: Vec<AleoStmt>,
+    debug_spans: Option<Vec<Option<Span>>>,
 }
 impl Display for AleoView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -347,6 +471,7 @@ pub struct AleoFunction {
     inputs: Vec<AleoInput>,
     statements: Vec<AleoStmt>,
     finalize: Option<AleoFinalize>,
+    debug_spans: Option<Vec<Option<Span>>>,
 }
 impl Display for AleoFunction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -369,6 +494,7 @@ pub struct AleoFinalize {
     caller_name: String,
     inputs: Vec<AleoInput>,
     statements: Vec<AleoStmt>,
+    debug_spans: Option<Vec<Option<Span>>>,
 }
 impl Display for AleoFinalize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -402,6 +528,7 @@ impl Display for AleoInput {
 #[derive(Debug)]
 pub struct AleoConstructor {
     statements: Vec<AleoStmt>,
+    debug_spans: Option<Vec<Option<Span>>>,
 }
 impl Display for AleoConstructor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

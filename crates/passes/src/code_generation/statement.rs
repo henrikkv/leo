@@ -28,6 +28,7 @@ use leo_ast::{
     ExpressionStatement,
     IterationStatement,
     Mode,
+    Node,
     Output,
     ReturnStatement,
     Statement,
@@ -39,7 +40,7 @@ use indexmap::IndexMap;
 
 impl CodeGeneratingVisitor<'_> {
     fn visit_statement(&mut self, input: &Statement) -> Vec<AleoStmt> {
-        match input {
+        let out = match input {
             Statement::Assert(stmt) => self.visit_assert(stmt),
             Statement::Assign(stmt) => vec![self.visit_assign(stmt)],
             Statement::Block(stmt) => self.visit_block(stmt),
@@ -51,7 +52,14 @@ impl CodeGeneratingVisitor<'_> {
             Statement::Expression(stmt) => self.visit_expression_statement(stmt),
             Statement::Iteration(stmt) => vec![self.visit_iteration(stmt)],
             Statement::Return(stmt) => self.visit_return(stmt),
+        };
+        if let Some(spans) = self.debug_spans.as_mut()
+            && !matches!(input, Statement::Block(..) | Statement::Conditional(..))
+        {
+            let span = input.span();
+            spans.extend(out.iter().filter(|stmt| !matches!(stmt, AleoStmt::Output(..))).map(|_| Some(span)));
         }
+        out
     }
 
     fn visit_assert(&mut self, input: &AssertStatement) -> Vec<AleoStmt> {
@@ -229,6 +237,9 @@ impl CodeGeneratingVisitor<'_> {
             let (condition, mut instructions) = self.visit_expression(&_input.condition);
             let condition = condition.expect("Trying to branch on an empty expression");
             instructions.push(AleoStmt::BranchEq(condition, AleoExpr::Bool(false), end_then_label.clone()));
+            if let Some(spans) = self.debug_spans.as_mut() {
+                spans.push(None);
+            }
 
             // Visit the `then` block.
             instructions.extend(self.visit_block(&_input.then));
@@ -239,10 +250,16 @@ impl CodeGeneratingVisitor<'_> {
                     AleoExpr::Bool(true),
                     end_otherwise_label.clone(),
                 ));
+                if let Some(spans) = self.debug_spans.as_mut() {
+                    spans.push(None);
+                }
             }
 
             // Add a label for the end of the `then` block.
             instructions.push(AleoStmt::Position(end_then_label));
+            if let Some(spans) = self.debug_spans.as_mut() {
+                spans.push(None);
+            }
 
             // Visit the `otherwise` block.
             if let Some(else_block) = &_input.otherwise {
@@ -250,6 +267,9 @@ impl CodeGeneratingVisitor<'_> {
                 instructions.extend(self.visit_statement(else_block));
                 // Add a label for the end of the `otherwise` block.
                 instructions.push(AleoStmt::Position(end_otherwise_label));
+                if let Some(spans) = self.debug_spans.as_mut() {
+                    spans.push(None);
+                }
             }
 
             // Decrement the conditional depth.

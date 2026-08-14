@@ -105,6 +105,11 @@ impl Package {
         self.unit_build_directory(name).join(ABI_FILENAME)
     }
 
+    pub fn unit_debug_path(&self, name: &str) -> PathBuf {
+        let bare = bare_unit_name(name);
+        self.unit_build_directory(name).join(format!("{bare}.dbg.json"))
+    }
+
     /// Path to a unit's interface ABI directory: `build/<name>/interfaces/`.
     /// Both programs and libraries can declare interfaces.
     pub fn unit_interfaces_directory(&self, name: &str) -> PathBuf {

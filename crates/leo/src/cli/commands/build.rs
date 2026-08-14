@@ -54,7 +54,7 @@ struct ProgramForValidation {
 
 impl From<BuildOptions> for CompilerOptions {
     fn from(options: BuildOptions) -> Self {
-        Self { no_std: options.no_std }
+        Self { no_std: options.no_std, debug_info: options.debug_info }
     }
 }
 
@@ -306,6 +306,13 @@ fn handle_build(command: &LeoBuild, context: Context) -> Result<<LeoBuild as Com
                         ensure_parent_dir(&primary_path)?;
                         std::fs::write(&primary_path, &compiled.primary.bytecode)
                             .map_err(crate::errors::failed_to_load_instructions)?;
+                        if let Some(debug_info) = &compiled.primary.debug_info {
+                            let debug_path = package.unit_debug_path(&unit_name);
+                            let debug_json = serde_json::to_string_pretty(debug_info)
+                                .map_err(|e| crate::errors::failed_to_serialize_debug_info(e.to_string()))?;
+                            std::fs::write(&debug_path, debug_json)
+                                .map_err(crate::errors::failed_to_write_debug_info)?;
+                        }
                         if is_main {
                             let abi_path = package.unit_abi_path(&unit_name);
                             let abi_json = serde_json::to_string_pretty(&compiled.primary.abi)
@@ -331,6 +338,14 @@ fn handle_build(command: &LeoBuild, context: Context) -> Result<<LeoBuild as Com
                                 .map_err(|e| crate::errors::failed_to_serialize_abi(e.to_string()))?;
                             std::fs::write(&import_abi_path, import_abi_json)
                                 .map_err(crate::errors::failed_to_write_abi)?;
+
+                            if let Some(debug_info) = &import.debug_info {
+                                let import_debug_path = package.unit_debug_path(&import.name);
+                                let import_debug_json = serde_json::to_string_pretty(debug_info)
+                                    .map_err(|e| crate::errors::failed_to_serialize_debug_info(e.to_string()))?;
+                                std::fs::write(&import_debug_path, import_debug_json)
+                                    .map_err(crate::errors::failed_to_write_debug_info)?;
+                            }
                         }
 
                         // Queue import for validation.
@@ -449,6 +464,12 @@ fn handle_build(command: &LeoBuild, context: Context) -> Result<<LeoBuild as Com
         let abi_json = serde_json::to_string_pretty(&compiled.primary.abi)
             .map_err(|e| crate::errors::failed_to_serialize_abi(e.to_string()))?;
         std::fs::write(&abi_path, abi_json).map_err(crate::errors::failed_to_write_abi)?;
+        if let Some(debug_info) = &compiled.primary.debug_info {
+            let debug_path = package.unit_debug_path(&unit_name);
+            let debug_json = serde_json::to_string_pretty(debug_info)
+                .map_err(|e| crate::errors::failed_to_serialize_debug_info(e.to_string()))?;
+            std::fs::write(&debug_path, debug_json).map_err(crate::errors::failed_to_write_debug_info)?;
+        }
         let interfaces_directory = package.unit_interfaces_directory(&unit_name);
         write_interface_abis(&interfaces_directory, &compiled.interfaces)?;
         compiled_programs.entry(unit_key).or_insert(ProgramForValidation {

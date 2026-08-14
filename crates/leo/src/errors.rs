@@ -334,3 +334,13 @@ pub(crate) fn missing_constructor(program: impl Display) -> Backtraced {
     Backtraced::error(CODE_PREFIX, CODE_MASK + 70, format!("program `{program}` must declare a constructor"))
         .with_help("Add a constructor such as `@noupgrade constructor() {}` before deploying the program.")
 }
+
+pub(crate) fn failed_to_serialize_debug_info(error: impl Display) -> Backtraced {
+    Backtraced::error(CODE_PREFIX, CODE_MASK + 71, format!("failed to serialize debug info to JSON: {error}"))
+        .with_help("This is an internal serialization failure.")
+}
+
+pub(crate) fn failed_to_write_debug_info(error: impl Display) -> Backtraced {
+    Backtraced::error(CODE_PREFIX, CODE_MASK + 72, format!("failed to write debug info file: {error}"))
+        .with_help("Verify the build output directory exists, is writable, and has enough free space.")
+}

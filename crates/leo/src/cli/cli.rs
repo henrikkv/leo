@@ -67,6 +67,11 @@ enum Commands {
         #[clap(flatten)]
         command: LeoRun,
     },
+    #[clap(about = "Debug a program with a tui")]
+    Debug {
+        #[clap(flatten)]
+        command: LeoDebug,
+    },
     #[clap(about = "Test a Leo program", visible_alias = "t")]
     Test {
         #[clap(flatten)]
@@ -150,6 +155,7 @@ impl Commands {
             Commands::Account { .. } => "account",
             Commands::New { .. } => "new",
             Commands::Run { .. } => "run",
+            Commands::Debug { .. } => "debug",
             Commands::Test { .. } => "test",
             Commands::Execute { .. } => "execute",
             Commands::Deploy { .. } => "deploy",
@@ -260,6 +266,7 @@ pub fn run_with_args(cli: CLI) -> Result<()> {
         Commands::Devnet { command } => command.try_execute(context)?,
         Commands::Devnode { command } => command.try_execute(context)?,
         Commands::Run { command } => command_output = Some(Output::Run(command.execute(context)?)),
+        Commands::Debug { command } => command.try_execute(context)?,
         Commands::Test { command } => command_output = Some(Output::Test(command.execute(context)?)),
         Commands::Execute { command } => command_output = Some(Output::Execute(command.execute(context)?)),
         Commands::Plugins => crate::cli::plugin::print_all(),

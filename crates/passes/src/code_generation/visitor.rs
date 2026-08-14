@@ -57,6 +57,8 @@ pub struct CodeGeneratingVisitor<'a> {
     /// Internal record input registers of the current function.
     /// This is necessary as if we output them, we need to clone them.
     pub internal_record_inputs: IndexSet<AleoExpr>,
+    pub debug_info: bool,
+    pub debug_spans: Option<Vec<Option<leo_span::Span>>>,
 }
 
 /// This function checks whether the constructor is well-formed.

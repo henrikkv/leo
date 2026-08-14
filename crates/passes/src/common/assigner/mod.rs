@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
 
-use leo_ast::{DefinitionPlace, DefinitionStatement, Expression, Identifier, NodeID, Statement};
+use leo_ast::{DefinitionPlace, DefinitionStatement, Expression, Identifier, Node, NodeID, Statement};
 use leo_span::Symbol;
 
 use std::{cell::RefCell, fmt::Display};
@@ -58,13 +58,7 @@ impl AssignerInner {
     /// Constructs the definition statement `let place = expr;`.
     /// This function should be the only place where `DefinitionStatement`s are constructed.
     fn simple_definition(&mut self, identifier: Identifier, value: Expression, id: NodeID) -> Statement {
-        DefinitionStatement {
-            place: DefinitionPlace::Single(identifier),
-            type_: None,
-            value,
-            span: Default::default(),
-            id,
-        }
-        .into()
+        let span = value.span();
+        DefinitionStatement { place: DefinitionPlace::Single(identifier), type_: None, value, span, id }.into()
     }
 }
