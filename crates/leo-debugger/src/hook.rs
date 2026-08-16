@@ -88,6 +88,8 @@ pub enum DebugCommand {
 pub struct HookState {
     pub breakpoints: BreakpointSet,
     pub debug_maps: IndexMap<String, ProgramDebugMap>,
+    /// Used to skip instructions in execute
+    pub skip_instructions: bool,
 }
 
 impl HookState {
@@ -136,11 +138,15 @@ pub fn make_hook(
     state: Arc<Mutex<HookState>>,
     evt_tx: Sender<DebugEvent>,
     cmd_rx: Receiver<DebugCommand>,
-) -> Box<dyn FnMut(DebugPoint) -> DebugAction> {
-    let mut pending: Option<PendingStep> = None;
+) -> Box<dyn FnMut(DebugPoint) -> DebugAction + Send> {
+    let mut pending: Option<PendingStep> =
+        Some(PendingStep { depth_at_issue: 0, over: false, granularity: Granularity::Instruction, start_loc: None });
 
     Box::new(move |point: DebugPoint| {
         let guard = state.lock().expect("debug hook state mutex poisoned");
+        if guard.skip_instructions && point.kind == DebugPointKind::Instruction {
+            return DebugAction::Continue;
+        }
         let loc = guard.source_loc(&point.program_id, point.kind, &point.function_name, point.index);
         let should_break =
             guard.breakpoints.contains(&point.program_id, &point.function_name, point.kind.into(), point.index);
@@ -164,56 +170,54 @@ pub fn make_hook(
             return DebugAction::Continue;
         }
 
-        loop {
-            if evt_tx.send(DebugEvent::Stopped(position.clone())).is_err() {
-                return DebugAction::Halt("debug event channel closed".to_string());
+        if evt_tx.send(DebugEvent::Stopped(position.clone())).is_err() {
+            return DebugAction::Halt("debug event channel closed".to_string());
+        }
+        let command = match cmd_rx.recv() {
+            Ok(command) => command,
+            Err(_) => return DebugAction::Halt("debug command channel closed".to_string()),
+        };
+        match command {
+            DebugCommand::Continue => {
+                pending = None;
+                DebugAction::Continue
             }
-            let command = match cmd_rx.recv() {
-                Ok(command) => command,
-                Err(_) => return DebugAction::Halt("debug command channel closed".to_string()),
-            };
-            match command {
-                DebugCommand::Continue => {
-                    pending = None;
-                    return DebugAction::Continue;
-                }
-                DebugCommand::Quit => return DebugAction::Halt("quit".to_string()),
-                DebugCommand::StepInto => {
-                    pending = Some(PendingStep {
-                        depth_at_issue: point.depth,
-                        over: false,
-                        granularity: Granularity::Line,
-                        start_loc: loc.map(|l| (l.file, l.line)),
-                    });
-                    return DebugAction::Continue;
-                }
-                DebugCommand::StepOverLine => {
-                    pending = Some(PendingStep {
-                        depth_at_issue: point.depth,
-                        over: true,
-                        granularity: Granularity::Line,
-                        start_loc: loc.map(|l| (l.file, l.line)),
-                    });
-                    return DebugAction::Continue;
-                }
-                DebugCommand::StepInstr => {
-                    pending = Some(PendingStep {
-                        depth_at_issue: point.depth,
-                        over: false,
-                        granularity: Granularity::Instruction,
-                        start_loc: None,
-                    });
-                    return DebugAction::Continue;
-                }
-                DebugCommand::NextInstr => {
-                    pending = Some(PendingStep {
-                        depth_at_issue: point.depth,
-                        over: true,
-                        granularity: Granularity::Instruction,
-                        start_loc: None,
-                    });
-                    return DebugAction::Continue;
-                }
+            DebugCommand::Quit => DebugAction::Halt("quit".to_string()),
+            DebugCommand::StepInto => {
+                pending = Some(PendingStep {
+                    depth_at_issue: point.depth,
+                    over: false,
+                    granularity: Granularity::Line,
+                    start_loc: loc.map(|l| (l.file, l.line)),
+                });
+                DebugAction::Continue
+            }
+            DebugCommand::StepOverLine => {
+                pending = Some(PendingStep {
+                    depth_at_issue: point.depth,
+                    over: true,
+                    granularity: Granularity::Line,
+                    start_loc: loc.map(|l| (l.file, l.line)),
+                });
+                DebugAction::Continue
+            }
+            DebugCommand::StepInstr => {
+                pending = Some(PendingStep {
+                    depth_at_issue: point.depth,
+                    over: false,
+                    granularity: Granularity::Instruction,
+                    start_loc: None,
+                });
+                DebugAction::Continue
+            }
+            DebugCommand::NextInstr => {
+                pending = Some(PendingStep {
+                    depth_at_issue: point.depth,
+                    over: true,
+                    granularity: Granularity::Instruction,
+                    start_loc: None,
+                });
+                DebugAction::Continue
             }
         }
     })

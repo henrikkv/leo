@@ -48,7 +48,7 @@ pub struct BuildOptions {
     pub checksums: bool,
     #[clap(skip)]
     pub no_std: bool,
-    #[clap(skip)]
+    #[clap(long, help = "Output a `.dbg.json` debug info file for each compiled program.")]
     pub debug_info: bool,
 }
 

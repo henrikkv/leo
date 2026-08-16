@@ -21,7 +21,7 @@ pub mod session;
 pub mod tui;
 
 pub use hook::{Context, DebugCommand, DebugEvent, HookState, Phase, SourceLoc};
-pub use session::{ProgramSource, Session, SessionConfig};
+pub use session::{DebugContext, ProgramSource, Session, SessionConfig};
 
 #[cfg(test)]
 mod tests;

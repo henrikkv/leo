@@ -34,7 +34,7 @@ use snarkvm::{
     },
     synthesizer::program::FinalizeGlobalState,
 };
-use snarkvm_synthesizer_process::{Process, set_debug_hook};
+use snarkvm_synthesizer_process::{Process, debug_session_guard, set_debug_hook};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -72,37 +72,82 @@ pub struct Session {
     pub handle: JoinHandle<()>,
 }
 
+pub struct DebugContext {
+    evt_tx: Sender<DebugEvent>,
+    state: Arc<Mutex<HookState>>,
+    cmd_rx: Mutex<Option<Receiver<DebugCommand>>>,
+}
+
+impl DebugContext {
+    pub fn install_hook(&self) {
+        if let Some(cmd_rx) = self.cmd_rx.lock().expect("debug context mutex poisoned").take() {
+            set_debug_hook(Some(make_hook(self.state.clone(), self.evt_tx.clone(), cmd_rx)));
+        }
+    }
+
+    pub fn send_event(&self, event: DebugEvent) {
+        let _ = self.evt_tx.send(event);
+    }
+
+    pub fn skip_instructions(&self, suppress: bool) {
+        self.state.lock().expect("debug hook state mutex poisoned").skip_instructions = suppress;
+    }
+}
+
 impl Session {
     pub fn spawn(config: SessionConfig) -> Self {
+        let SessionConfig { programs, private_key, program_id, function_name, inputs, initial_breakpoints } = config;
+        let programs = Arc::new(programs);
+        let work_programs = programs.clone();
+        let (session, _result) = Self::spawn_around(&programs, initial_breakpoints, move |context| {
+            run(&work_programs, &private_key, &program_id, &function_name, &inputs, context)
+        });
+        session
+    }
+
+    pub fn spawn_around<T: Send + 'static>(
+        programs: &[ProgramSource],
+        initial_breakpoints: Vec<BreakpointKey>,
+        work: impl FnOnce(&DebugContext) -> Result<T> + Send + 'static,
+    ) -> (Self, Arc<Mutex<Option<Result<T>>>>) {
         let mut debug_maps = IndexMap::new();
-        for program in &config.programs {
+        for program in programs {
             if let Some(debug_info) = &program.debug_info {
                 debug_maps.insert(program.name.clone(), debug_info.clone());
             }
         }
         let mut breakpoints = BreakpointSet::default();
-        for key in &config.initial_breakpoints {
-            breakpoints.insert(key.clone());
+        for key in initial_breakpoints {
+            breakpoints.insert(key);
         }
-        let state = Arc::new(Mutex::new(HookState { breakpoints, debug_maps }));
+        let state = Arc::new(Mutex::new(HookState { breakpoints, debug_maps, skip_instructions: false }));
 
         let (cmd_tx, cmd_rx) = unbounded();
         let (evt_tx, evt_rx) = unbounded();
 
+        let result_slot = Arc::new(Mutex::new(None));
+        let work_slot = result_slot.clone();
         let hook_state = state.clone();
         let hook_evt_tx = evt_tx.clone();
-        let SessionConfig { programs, private_key, program_id, function_name, inputs, initial_breakpoints: _ } = config;
 
         let handle = std::thread::spawn(move || {
-            let result =
-                run(&programs, &private_key, &program_id, &function_name, &inputs, &hook_evt_tx, hook_state, cmd_rx);
-            if let Err(error) = result {
-                let _ = hook_evt_tx.send(DebugEvent::Halted { reason: full_chain(&error) });
-            }
+            let _session_guard = debug_session_guard();
+            let context =
+                DebugContext { evt_tx: hook_evt_tx.clone(), state: hook_state, cmd_rx: Mutex::new(Some(cmd_rx)) };
+            let result = work(&context);
             set_debug_hook(None);
+            match &result {
+                Ok(_) => {
+                    let _ = hook_evt_tx.send(DebugEvent::Finished);
+                }
+                Err(error) => {
+                    let _ = hook_evt_tx.send(DebugEvent::Halted { reason: full_chain(error) });
+                }
+            }
+            *work_slot.lock().expect("debug result mutex poisoned") = Some(result);
         });
 
-        Self { cmd_tx, evt_rx, state, handle }
+        (Self { cmd_tx, evt_rx, state, handle }, result_slot)
     }
 }
 
@@ -110,16 +155,13 @@ fn full_chain(error: &anyhow::Error) -> String {
     error.chain().map(|cause| cause.to_string()).collect::<Vec<_>>().join(": ")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run(
     programs: &[ProgramSource],
     private_key: &PrivateKey<CurrentNetwork>,
     program_id_str: &str,
     function_name_str: &str,
     inputs: &[String],
-    evt_tx: &Sender<DebugEvent>,
-    hook_state: Arc<Mutex<HookState>>,
-    cmd_rx: Receiver<DebugCommand>,
+    context: &DebugContext,
 ) -> Result<()> {
     let process = Process::<CurrentNetwork>::load().context("failed to load a fresh snarkVM process")?;
     let mut parsed_programs = Vec::with_capacity(programs.len());
@@ -153,7 +195,7 @@ fn run(
         .authorize::<CurrentAleo, _>(private_key, program_id, function_id, parsed_inputs.iter(), rng)
         .context("failed to authorize the call")?;
 
-    set_debug_hook(Some(make_hook(hook_state, evt_tx.clone(), cmd_rx)));
+    context.install_hook();
     process.evaluate::<CurrentAleo>(authorization.clone()).context("evaluation failed")?;
 
     let has_finalize = parsed_programs
@@ -166,7 +208,7 @@ fn run(
         let execution = Execution::from(authorization.transitions().into_values(), Default::default(), None)
             .context("failed to build an execution from the authorized transitions")?;
 
-        let _ = evt_tx.send(DebugEvent::PhaseChange(Phase::Finalize));
+        context.send_event(DebugEvent::PhaseChange(Phase::Finalize));
         let state =
             FinalizeGlobalState::new_genesis::<CurrentNetwork>().context("failed to build finalize global state")?;
         process
@@ -175,6 +217,5 @@ fn run(
             .map_err(|error| anyhow::anyhow!("finalization failed: {error}"))?;
     }
 
-    let _ = evt_tx.send(DebugEvent::Finished);
     Ok(())
 }

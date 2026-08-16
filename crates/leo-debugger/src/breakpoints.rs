@@ -53,13 +53,18 @@ impl BreakpointSet {
     }
 }
 
+/// (source-file index, function name, transition-or-finalize context)
+type GroupKey = (usize, String, Context);
+/// (line, instruction index)
+type LineEntries = Vec<(u32, usize)>;
+
 pub struct ReverseIndex {
-    by_file_function_context: Vec<((usize, String, Context), Vec<(u32, usize)>)>,
+    by_file_function_context: Vec<(GroupKey, LineEntries)>,
 }
 
 impl ReverseIndex {
     pub fn build(debug_map: &ProgramDebugMap) -> Self {
-        let mut grouped: Vec<((usize, String, Context), Vec<(u32, usize)>)> = Vec::new();
+        let mut grouped: Vec<(GroupKey, LineEntries)> = Vec::new();
 
         let sections: [(_, Context); 4] = [
             (&debug_map.functions, Context::Transition),
